@@ -2,7 +2,7 @@ name: Rustix Auto Restart
 
 on:
   schedule:
-    # 每小时运行一次
+    # 每两小时运行一次
     - cron: '22 */2 * * *'
   workflow_dispatch: # 允许手动触发
 
@@ -33,9 +33,10 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: python rustix.py
 
-      # 新增：自动删除旧的工作流运行记录，仅保留最近的 1 条
+      # 自动删除旧的工作流运行记录，仅保留最近的 1 条
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
