@@ -4,6 +4,7 @@ import os
 import json
 import sys
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
@@ -35,25 +36,47 @@ async def process_account(account):
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-infobars"
+                "--disable-infobars",
+                "--window-size=1280,720"
             ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720}
         )
         page = await context.new_page()
 
-        print(f"\n>>> 开始处理账户: {account['user']}")
-        # 建立连接即返回，防止死等 slow 资源
-        await page.goto(LOGIN_URL, wait_until="commit", timeout=60000)
+        # 开启反自动化检测 (Stealth)
+        await stealth_async(page)
 
-        # 1. 登录（显式等待输入框挂载）
-        input_selector = '//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input'
-        await page.wait_for_selector(input_selector, timeout=30000)
-        
-        await page.fill(input_selector, account['user'])
-        await page.fill('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[2]/div[2]/div/div/input', account['pwd'])
-        await page.click('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[4]/button')
+        print(f"\n>>> 开始处理账户: {account['user']}")
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+
+        # 缓冲 6 秒让 Cloudflare 5秒盾/人机验证在后台自动完成通过
+        print("⏳ 正在进行 Cloudflare 人机验证防封伪装，等待 6 秒...")
+        await asyncio.sleep(6)
+
+        # 1. 登录（兼容多种选择器）
+        input_selector = 'input[type="text"], input[type="email"], input[name="email"], //*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input'
+        try:
+            await page.wait_for_selector(input_selector, timeout=30000)
+        except Exception as e:
+            print("❌ 依然未能找到登录框，正在截图保存页面状态...")
+            await page.screenshot(path="cloudflare_block.png")
+            raise e
+
+        # 填写账号与密码
+        inputs = await page.query_selector_all('input')
+        if len(inputs) >= 2:
+            await inputs[0].fill(account['user'])
+            await inputs[1].fill(account['pwd'])
+        else:
+            await page.fill(input_selector, account['user'])
+            await page.fill('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[2]/div[2]/div/div/input', account['pwd'])
+
+        # 点击登录按钮
+        login_btn = '//button[@type="submit"] | //button[contains(@class, "button")]'
+        await page.click(login_btn)
 
         # 2. 进入管理页
         await page.wait_for_selector('section', timeout=30000)
