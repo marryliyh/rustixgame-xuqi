@@ -37,7 +37,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests
+          pip install playwright requests playwright-stealth
           playwright install chromium
 
       - name: Run script
