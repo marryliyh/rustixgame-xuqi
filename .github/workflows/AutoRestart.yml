@@ -22,23 +22,9 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 原生 Shell 安装并启动 Cloudflare WARP 伪装 IP
-      - name: Setup Cloudflare WARP
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
-          warp-cli --accept-tos connect || true
-          sleep 5
-          echo "🌐 WARP 状态检查："
-          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip|warp" || true
-
       - name: Install dependencies
         run: |
-          pip install playwright requests playwright-stealth
-          playwright install chromium
+          pip install requests
 
       - name: Run script
         env:
