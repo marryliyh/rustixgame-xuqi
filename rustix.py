@@ -3,20 +3,12 @@ import requests
 import os
 import json
 import sys
-import urllib.parse
-import base64
-import subprocess
-import time
-import shutil
-import tarfile
-import urllib.request
 from playwright.async_api import async_playwright
 
 # --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 ACCOUNTS_JSON = os.environ.get("ACCOUNTS_JSON")
-NODE_LINK = os.environ.get("NODE_LINK")
 
 LOGIN_URL = "https://my.rustix.me/auth/login"
 
@@ -34,266 +26,28 @@ def send_tg_message(text):
     except Exception as e:
         print(f"发送 TG 消息失败: {e}")
 
-def ensure_sing_box():
-    """检测或下载 sing-box 核心程序"""
-    if shutil.which("sing-box") or os.path.exists("./sing-box"):
-        return "./sing-box" if os.path.exists("./sing-box") else "sing-box"
-    
-    print("📥 未在系统中找到 sing-box，正在自动下载客户端...")
-    url = "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-1.11.0-linux-amd64.tar.gz"
-    tar_path = "sing-box.tar.gz"
-    urllib.request.urlretrieve(url, tar_path)
-    
-    with tarfile.open(tar_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.endswith("/sing-box"):
-                f = tar.extractfile(member)
-                with open("sing-box", "wb") as out:
-                    out.write(f.read())
-                os.chmod("sing-box", 0o755)
-                break
-    if os.path.exists(tar_path):
-        os.remove(tar_path)
-    return "./sing-box"
-
-def test_proxy_connectivity(proxy_url):
-    """测试代理节点连通性"""
-    print("🧪 正在测试代理节点的连通性...")
-    proxies = {"http": proxy_url, "https": proxy_url}
-    
-    # 1. 测试访问目标网站
-    try:
-        res = requests.get(LOGIN_URL, proxies=proxies, timeout=12)
-        print(f"✅ 代理测试成功！目标网站返回状态码: {res.status_code}")
-        return
-    except Exception as e:
-        print(f"⚠️ 通过代理连接目标网站失败: {e}")
-
-    # 2. 如果目标网站连接失败，测试通用公网
-    try:
-        requests.get("https://www.google.com", proxies=proxies, timeout=10)
-        print("💡 节点可访问公网，但 my.rustix.me 拒绝了该节点 IP 或响应超时。")
-    except Exception:
-        print("❌ 代理节点本身不可用/已失效！请更换 Secrets 中的 NODE_LINK。")
-    raise RuntimeError("代理网络无法连接到目标网站，终止执行。")
-
-def parse_and_setup_proxy(node_link):
-    """解析 NODE_LINK 并配置代理，返回 (proxy_server_url, subprocess_handle)"""
-    if not node_link or not node_link.strip():
-        print("ℹ️ 未提供 NODE_LINK，将使用直连模式。")
-        return None, None
-
-    node_link = node_link.strip()
-
-    # 1. 标准代理直接透传
-    if node_link.startswith(("http://", "https://", "socks5://", "socks5h://")):
-        print(f"✅ 检测到标准 HTTP/SOCKS5 代理，直接加载使用。")
-        test_proxy_connectivity(node_link)
-        return node_link, None
-
-    # 2. 复杂节点解析
-    print("🌐 正在解析 NODE_LINK 节点信息，启动 sing-box 本地中转...")
-    sing_box_bin = ensure_sing_box()
-
-    parsed = urllib.parse.urlparse(node_link)
-    scheme = parsed.scheme.lower()
-    query = urllib.parse.parse_qs(parsed.query)
-
-    def get_q(k, default=""):
-        return query.get(k, [default])[0]
-
-    outbound = {}
-
-    if scheme == "vless":
-        outbound = {
-            "type": "vless",
-            "tag": "proxy",
-            "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "uuid": parsed.username
-        }
-        if get_q("flow"):
-            outbound["flow"] = get_q("flow")
-        security = get_q("security")
-        if security in ["tls", "reality"]:
-            tls_cfg = {
-                "enabled": True,
-                "server_name": get_q("sni", parsed.hostname),
-                "insecure": get_q("allowInsecure") == "1" or get_q("insecure") == "1"
-            }
-            fp = get_q("fp", "chrome")
-            if security == "reality" or fp:
-                tls_cfg["utls"] = {
-                    "enabled": True,
-                    "fingerprint": fp if fp else "chrome"
-                }
-            if security == "reality":
-                tls_cfg["reality"] = {
-                    "enabled": True,
-                    "public_key": get_q("pbk"),
-                    "short_id": get_q("sid")
-                }
-            outbound["tls"] = tls_cfg
-            
-        net_type = get_q("type")
-        if net_type in ["ws", "grpc"]:
-            trans = {"type": net_type}
-            if net_type == "ws":
-                trans["path"] = get_q("path", "/")
-                if get_q("host"):
-                    trans["headers"] = {"Host": get_q("host")}
-            elif net_type == "grpc":
-                trans["service_name"] = get_q("serviceName")
-            outbound["transport"] = trans
-
-    elif scheme == "vmess":
-        b64_str = node_link[8:]
-        b64_str += "=" * (-len(b64_str) % 4)
-        vdata = json.loads(base64.b64decode(b64_str).decode('utf-8'))
-        outbound = {
-            "type": "vmess",
-            "tag": "proxy",
-            "server": vdata.get("add"),
-            "server_port": int(vdata.get("port", 443)),
-            "uuid": vdata.get("id"),
-            "alter_id": int(vdata.get("aid", 0)),
-            "security": "auto"
-        }
-        if vdata.get("tls") == "tls":
-            outbound["tls"] = {
-                "enabled": True,
-                "server_name": vdata.get("sni") or vdata.get("host") or vdata.get("add")
-            }
-            if vdata.get("fp"):
-                outbound["tls"]["utls"] = {
-                    "enabled": True,
-                    "fingerprint": vdata.get("fp")
-                }
-        net_type = vdata.get("net")
-        if net_type in ["ws", "grpc"]:
-            trans = {"type": net_type}
-            if net_type == "ws":
-                trans["path"] = vdata.get("path", "/")
-                if vdata.get("host"):
-                    trans["headers"] = {"Host": vdata.get("host")}
-            elif net_type == "grpc":
-                trans["service_name"] = vdata.get("path")
-            outbound["transport"] = trans
-
-    elif scheme == "trojan":
-        outbound = {
-            "type": "trojan",
-            "tag": "proxy",
-            "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "password": parsed.username or parsed.password,
-            "tls": {
-                "enabled": True,
-                "server_name": get_q("sni", parsed.hostname),
-                "insecure": get_q("allowInsecure") == "1"
-            }
-        }
-        if get_q("fp"):
-            outbound["tls"]["utls"] = {
-                "enabled": True,
-                "fingerprint": get_q("fp")
-            }
-
-    elif scheme in ["hysteria2", "hy2"]:
-        outbound = {
-            "type": "hysteria2",
-            "tag": "proxy",
-            "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "password": parsed.username or parsed.password,
-            "tls": {
-                "enabled": True,
-                "server_name": get_q("sni", parsed.hostname),
-                "insecure": get_q("insecure") == "1"
-            }
-        }
-
-    elif scheme == "tuic":
-        outbound = {
-            "type": "tuic",
-            "tag": "proxy",
-            "server": parsed.hostname,
-            "server_port": parsed.port or 443,
-            "uuid": parsed.username,
-            "password": parsed.password,
-            "congestion_control": "bbr",
-            "tls": {
-                "enabled": True,
-                "server_name": get_q("sni", parsed.hostname),
-                "insecure": get_q("allow_insecure") == "1"
-            }
-        }
-    else:
-        raise ValueError(f"暂不支持的节点协议: {scheme}")
-
-    config = {
-        "dns": {
-            "servers": [{"tag": "dns-remote", "address": "tls://8.8.8.8"}]
-        },
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 10808
-            }
-        ],
-        "outbounds": [outbound]
-    }
-
-    with open("sing_box_config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-    proc = subprocess.Popen(
-        [sing_box_bin, "run", "-c", "sing_box_config.json"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    time.sleep(3)
-    
-    if proc.poll() is not None:
-        _, stderr_log = proc.communicate()
-        raise RuntimeError(f"sing-box 启动失败，日志信息:\n{stderr_log}")
-
-    print("🚀 本地中转代理已启动 (127.0.0.1:10808)")
-    
-    # 测试节点连通性
-    test_proxy_connectivity("http://127.0.0.1:10808")
-    
-    return "http://127.0.0.1:10808", proc
-
-async def process_account(account, proxy_server=None):
+async def process_account(account):
     """处理单个账户的逻辑"""
     async with async_playwright() as p:
-        launch_kwargs = {
-            "headless": True,
-            "args": [
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars"
             ]
-        }
-        if proxy_server:
-            launch_kwargs["proxy"] = {"server": proxy_server}
-
-        browser = await p.chromium.launch(**launch_kwargs)
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
         print(f"\n>>> 开始处理账户: {account['user']}")
-        # 优化点：使用 commit 策略（收到 HTTP 头部即返回，不等待 DOM 挂载，彻底防止卡死）
+        # 建立连接即返回，防止死等 slow 资源
         await page.goto(LOGIN_URL, wait_until="commit", timeout=60000)
 
-        # 1. 登录（显式等待输入框出现）
+        # 1. 登录（显式等待输入框挂载）
         input_selector = '//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input'
         await page.wait_for_selector(input_selector, timeout=30000)
         
@@ -360,21 +114,14 @@ async def main():
         print("错误: 未找到 ACCOUNTS_JSON 环境变量，请检查 GitHub Secrets 配置。")
         sys.exit(1)
 
-    proxy_server, singbox_proc = None, None
     try:
-        # 解析并启动代理
-        proxy_server, singbox_proc = parse_and_setup_proxy(NODE_LINK)
-
         accounts = json.loads(ACCOUNTS_JSON)
         for account in accounts:
-            await process_account(account, proxy_server)
+            await process_account(account)
         send_tg_message("所有账户操作完毕。 🎉")
     except Exception as e:
         print(f"脚本运行错误: {str(e)}")
         send_tg_message(f"⚠️ 脚本运行出现错误，请检查 GitHub Actions 日志。\n错误详情: `{str(e)}`")
-    finally:
-        if singbox_proc and singbox_proc.poll() is None:
-            singbox_proc.terminate()
 
 if __name__ == "__main__":
     asyncio.run(main())
