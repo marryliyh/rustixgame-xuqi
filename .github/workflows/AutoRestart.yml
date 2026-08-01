@@ -9,7 +9,6 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    # 赋予工作流删除历史记录的权限
     permissions:
       actions: write
       contents: read
@@ -23,6 +22,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      # 关键步骤：启动 Cloudflare WARP 伪装 IP，跳过 Cloudflare 拦截与数据中心封锁
+      - name: Setup Cloudflare WARP
+        uses: finnie54/warp-action@v1
+
       - name: Install dependencies
         run: |
           pip install playwright requests
@@ -33,10 +36,9 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
-          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: python rustix.py
 
-      # 自动删除旧的工作流运行记录，仅保留最近的 1 条
+      # 自动删除旧的工作流运行记录，仅保留最近 1 条
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
