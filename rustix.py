@@ -64,12 +64,12 @@ def parse_and_setup_proxy(node_link):
 
     node_link = node_link.strip()
 
-    # 1. 如果是基础 HTTP/SOCKS5 代理，Playwright 原生支持
+    # 1. 标准代理直接透传
     if node_link.startswith(("http://", "https://", "socks5://", "socks5h://")):
         print(f"✅ 检测到标准 HTTP/SOCKS5 代理，直接加载使用。")
         return node_link, None
 
-    # 2. 如果是节点链接（VLESS / VMess / Trojan / Hysteria2 / TUIC）
+    # 2. 复杂节点解析
     print("🌐 正在解析 NODE_LINK 节点信息，启动 sing-box 本地中转...")
     sing_box_bin = ensure_sing_box()
 
@@ -99,6 +99,13 @@ def parse_and_setup_proxy(node_link):
                 "server_name": get_q("sni", parsed.hostname),
                 "insecure": get_q("allowInsecure") == "1" or get_q("insecure") == "1"
             }
+            # REALITY 或配置了 fp 的节点必须开启 uTLS
+            fp = get_q("fp", "chrome")
+            if security == "reality" or fp:
+                tls_cfg["utls"] = {
+                    "enabled": True,
+                    "fingerprint": fp if fp else "chrome"
+                }
             if security == "reality":
                 tls_cfg["reality"] = {
                     "enabled": True,
@@ -106,6 +113,7 @@ def parse_and_setup_proxy(node_link):
                     "short_id": get_q("sid")
                 }
             outbound["tls"] = tls_cfg
+            
         net_type = get_q("type")
         if net_type in ["ws", "grpc"]:
             trans = {"type": net_type}
@@ -135,6 +143,11 @@ def parse_and_setup_proxy(node_link):
                 "enabled": True,
                 "server_name": vdata.get("sni") or vdata.get("host") or vdata.get("add")
             }
+            if vdata.get("fp"):
+                outbound["tls"]["utls"] = {
+                    "enabled": True,
+                    "fingerprint": vdata.get("fp")
+                }
         net_type = vdata.get("net")
         if net_type in ["ws", "grpc"]:
             trans = {"type": net_type}
@@ -159,6 +172,11 @@ def parse_and_setup_proxy(node_link):
                 "insecure": get_q("allowInsecure") == "1"
             }
         }
+        if get_q("fp"):
+            outbound["tls"]["utls"] = {
+                "enabled": True,
+                "fingerprint": get_q("fp")
+            }
 
     elif scheme in ["hysteria2", "hy2"]:
         outbound = {
@@ -207,15 +225,25 @@ def parse_and_setup_proxy(node_link):
     with open("sing_box_config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    proc = subprocess.Popen([sing_box_bin, "run", "-c", "sing_box_config.json"])
+    proc = subprocess.Popen(
+        [sing_box_bin, "run", "-c", "sing_box_config.json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
     time.sleep(3)
+    
+    # 检查进程是否意外退出
+    if proc.poll() is not None:
+        _, stderr_log = proc.communicate()
+        raise RuntimeError(f"sing-box 启动失败，日志信息:\n{stderr_log}")
+
     print("🚀 本地中转代理已启动 (127.0.0.1:10808)")
     return "http://127.0.0.1:10808", proc
 
 async def process_account(account, proxy_server=None):
     """处理单个账户的逻辑"""
     async with async_playwright() as p:
-        # 配置代理参数
         launch_kwargs = {"headless": True}
         if proxy_server:
             launch_kwargs["proxy"] = {"server": proxy_server}
@@ -225,7 +253,6 @@ async def process_account(account, proxy_server=None):
         page = await context.new_page()
 
         print(f"\n>>> 开始处理账户: {account['user']}")
-        # 优化点：调整等待条件为 domcontentloaded 并延长超时至 60 秒
         await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
         # 1. 登录
@@ -305,8 +332,7 @@ async def main():
         print(f"脚本运行错误: {str(e)}")
         send_tg_message(f"⚠️ 脚本运行出现错误，请检查 GitHub Actions 日志。\n错误详情: `{str(e)}`")
     finally:
-        # 结束 sing-box 进程
-        if singbox_proc:
+        if singbox_proc and singbox_proc.poll() is None:
             singbox_proc.terminate()
 
 if __name__ == "__main__":
