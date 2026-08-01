@@ -56,6 +56,27 @@ def ensure_sing_box():
         os.remove(tar_path)
     return "./sing-box"
 
+def test_proxy_connectivity(proxy_url):
+    """测试代理节点连通性"""
+    print("🧪 正在测试代理节点的连通性...")
+    proxies = {"http": proxy_url, "https": proxy_url}
+    
+    # 1. 测试访问目标网站
+    try:
+        res = requests.get(LOGIN_URL, proxies=proxies, timeout=12)
+        print(f"✅ 代理测试成功！目标网站返回状态码: {res.status_code}")
+        return
+    except Exception as e:
+        print(f"⚠️ 通过代理连接目标网站失败: {e}")
+
+    # 2. 如果目标网站连接失败，测试通用公网
+    try:
+        requests.get("https://www.google.com", proxies=proxies, timeout=10)
+        print("💡 节点可访问公网，但 my.rustix.me 拒绝了该节点 IP 或响应超时。")
+    except Exception:
+        print("❌ 代理节点本身不可用/已失效！请更换 Secrets 中的 NODE_LINK。")
+    raise RuntimeError("代理网络无法连接到目标网站，终止执行。")
+
 def parse_and_setup_proxy(node_link):
     """解析 NODE_LINK 并配置代理，返回 (proxy_server_url, subprocess_handle)"""
     if not node_link or not node_link.strip():
@@ -67,6 +88,7 @@ def parse_and_setup_proxy(node_link):
     # 1. 标准代理直接透传
     if node_link.startswith(("http://", "https://", "socks5://", "socks5h://")):
         print(f"✅ 检测到标准 HTTP/SOCKS5 代理，直接加载使用。")
+        test_proxy_connectivity(node_link)
         return node_link, None
 
     # 2. 复杂节点解析
@@ -99,7 +121,6 @@ def parse_and_setup_proxy(node_link):
                 "server_name": get_q("sni", parsed.hostname),
                 "insecure": get_q("allowInsecure") == "1" or get_q("insecure") == "1"
             }
-            # REALITY 或配置了 fp 的节点必须开启 uTLS
             fp = get_q("fp", "chrome")
             if security == "reality" or fp:
                 tls_cfg["utls"] = {
@@ -211,6 +232,9 @@ def parse_and_setup_proxy(node_link):
         raise ValueError(f"暂不支持的节点协议: {scheme}")
 
     config = {
+        "dns": {
+            "servers": [{"tag": "dns-remote", "address": "tls://8.8.8.8"}]
+        },
         "inbounds": [
             {
                 "type": "mixed",
@@ -233,30 +257,47 @@ def parse_and_setup_proxy(node_link):
     )
     time.sleep(3)
     
-    # 检查进程是否意外退出
     if proc.poll() is not None:
         _, stderr_log = proc.communicate()
         raise RuntimeError(f"sing-box 启动失败，日志信息:\n{stderr_log}")
 
     print("🚀 本地中转代理已启动 (127.0.0.1:10808)")
+    
+    # 测试节点连通性
+    test_proxy_connectivity("http://127.0.0.1:10808")
+    
     return "http://127.0.0.1:10808", proc
 
 async def process_account(account, proxy_server=None):
     """处理单个账户的逻辑"""
     async with async_playwright() as p:
-        launch_kwargs = {"headless": True}
+        launch_kwargs = {
+            "headless": True,
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars"
+            ]
+        }
         if proxy_server:
             launch_kwargs["proxy"] = {"server": proxy_server}
 
         browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
         print(f"\n>>> 开始处理账户: {account['user']}")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        # 优化点：使用 commit 策略（收到 HTTP 头部即返回，不等待 DOM 挂载，彻底防止卡死）
+        await page.goto(LOGIN_URL, wait_until="commit", timeout=60000)
 
-        # 1. 登录
-        await page.fill('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input', account['user'])
+        # 1. 登录（显式等待输入框出现）
+        input_selector = '//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input'
+        await page.wait_for_selector(input_selector, timeout=30000)
+        
+        await page.fill(input_selector, account['user'])
         await page.fill('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[2]/div[2]/div/div/input', account['pwd'])
         await page.click('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[4]/button')
 
@@ -321,7 +362,7 @@ async def main():
 
     proxy_server, singbox_proc = None, None
     try:
-        # 解析代理
+        # 解析并启动代理
         proxy_server, singbox_proc = parse_and_setup_proxy(NODE_LINK)
 
         accounts = json.loads(ACCOUNTS_JSON)
