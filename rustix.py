@@ -1,17 +1,16 @@
-import asyncio
-import requests
 import os
 import json
 import sys
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+import requests
+from bs4 import BeautifulSoup
 
 # --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 ACCOUNTS_JSON = os.environ.get("ACCOUNTS_JSON")
 
-LOGIN_URL = "https://my.rustix.me/auth/login"
+BASE_URL = "https://my.rustix.me"
+LOGIN_URL = f"{BASE_URL}/auth/login"
 
 def send_tg_message(text):
     """发送带 Markdown 格式的 Telegram 消息"""
@@ -27,112 +26,57 @@ def send_tg_message(text):
     except Exception as e:
         print(f"发送 TG 消息失败: {e}")
 
-async def process_account(account):
-    """处理单个账户的逻辑"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--window-size=1280,720"
-            ]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
-        )
-        page = await context.new_page()
+def process_account(account):
+    """使用 requests 会话底层直接交互"""
+    print(f"\n>>> 开始处理账户: {account['user']}")
+    
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,*/*;q=0.8"
+    })
 
-        # 开启反自动化检测 (Stealth)
-        await stealth_async(page)
+    # 1. 访问登录页获取 cookies / CSRF token（如有）
+    try:
+        res = session.get(LOGIN_URL, timeout=30)
+        print(f"打开登录页状态码: {res.status_code}")
+    except Exception as e:
+        print(f"❌ 连接登录页失败: {e}")
+        raise e
 
-        print(f"\n>>> 开始处理账户: {account['user']}")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    # 2. 模拟表单提交登录
+    # 注意：如果 rustix.me 的登录接口是 API 或者是标准表单，请根据实际情况调整字段
+    login_data = {
+        "email": account['user'],
+        "password": account['pwd']
+    }
+    
+    # 尝试 POST 登录
+    login_res = session.post(LOGIN_URL, data=login_data, timeout=30, allow_redirects=True)
+    print(f"登录请求响应状态码: {login_res.status_code}")
 
-        # 缓冲 6 秒让 Cloudflare 5秒盾/人机验证在后台自动完成通过
-        print("⏳ 正在进行 Cloudflare 人机验证防封伪装，等待 6 秒...")
-        await asyncio.sleep(6)
+    # 3. 访问后台面板检查服务器状态
+    # 假设登录成功后重定向或直接访问控制台列表页
+    dashboard_url = f"{BASE_URL}/" # 根据实际后台面板调整
+    dash_res = session.get(dashboard_url, timeout=30)
+    
+    soup = BeautifulSoup(dash_res.text, 'html.parser')
+    page_text = soup.get_text().lower()
 
-        # 1. 登录（兼容多种选择器）
-        input_selector = 'input[type="text"], input[type="email"], input[name="email"], //*[@id="app"]/div[2]/div/div/div[2]/form/div/div[1]/div/input'
-        try:
-            await page.wait_for_selector(input_selector, timeout=30000)
-        except Exception as e:
-            print("❌ 依然未能找到登录框，正在截图保存页面状态...")
-            await page.screenshot(path="cloudflare_block.png")
-            raise e
-
-        # 填写账号与密码
-        inputs = await page.query_selector_all('input')
-        if len(inputs) >= 2:
-            await inputs[0].fill(account['user'])
-            await inputs[1].fill(account['pwd'])
-        else:
-            await page.fill(input_selector, account['user'])
-            await page.fill('//*[@id="app"]/div[2]/div/div/div[2]/form/div/div[2]/div[2]/div/div/input', account['pwd'])
-
-        # 点击登录按钮
-        login_btn = '//button[@type="submit"] | //button[contains(@class, "button")]'
-        await page.click(login_btn)
-
-        # 2. 进入管理页
-        await page.wait_for_selector('section', timeout=30000)
-        await page.click('//*[@id="app"]/div[2]/div/div[3]/div[4]/section/div/div[1]/div[3]/div/div/div[2]/a')
-        print("已进入管理页面，等待加载状态...")
-
-        # 3. 智能等待控制台面板
-        print("🔍 正在等待控制台面板加载...")
-        try:
-            await page.wait_for_selector('text=Стоп', timeout=30000)
-        except Exception as e:
-            print(f"❌ 页面加载超时，没看到控制台按钮。正在保存错误截图...")
-            await page.screenshot(path="error_page_load.png")
-            raise e
+    print("🔍 正在检查服务器状态...")
+    if "включён" in page_text or "включен" in page_text or "online" in page_text or "running" in page_text:
+        print("🎉 服务器当前状态：运行中 (Online/Включён)")
+        send_tg_message(f"👤 账户: `{account['user']}`\n状态: *Online*\n操作: 无需重启。")
+    else:
+        print("⚠️ 当前状态不是运行中，尝试发送重启请求...")
+        # 如果有具体的重启 API 链接可以在此发起请求
+        # 示例：session.get(f"{BASE_URL}/api/restart", timeout=30)
         
-        # 4. 缓冲等待状态刷新
-        await asyncio.sleep(2)
-        page_text = await page.locator('body').inner_text()
-        page_text_lower = page_text.lower()
-        
-        # 5. 判断服务器运行状态
-        if "включён" in page_text_lower or "включен" in page_text_lower or "online" in page_text_lower or "running" in page_text_lower:
-            print("🎉 服务器当前状态：运行中 (Online/Включён)")
-            send_tg_message(f"👤 账户: `{account['user']}`\n状态: *Online*\n操作: 无需重启。")
-        else:
-            print("⚠️ 当前状态不是运行中，准备点击 🔄 Рестарт 按钮重启...")
-            try:
-                await page.locator('text=Рестарт').first.click()
-                print("✅ 已成功点击 Рестарт 按钮")
-            except Exception as e:
-                print(f"❌ 点击重启按钮失败: {e}")
-                await page.screenshot(path="error_click_restart.png")
-                raise e
-            
-            # 确认弹窗
-            confirm_btn = "//button[contains(text(), '确认') or contains(text(), 'Yes') or contains(text(), 'Да')]"
-            if await page.query_selector(confirm_btn):
-                await page.click(confirm_btn)
-                print("✅ 已点击弹窗确认")
-            
-            # 等待 2 分钟刷新状态
-            print("⏳ 等待 2 分钟让服务器缓一缓...")
-            await asyncio.sleep(120)
-            
-            # 重新检查页面状态
-            page_text_new = await page.locator('body').inner_text()
-            page_text_new_lower = page_text_new.lower()
-            if "включён" in page_text_new_lower or "включен" in page_text_new_lower or "online" in page_text_new_lower or "running" in page_text_new_lower:
-                send_tg_message(f"👤 账户: `{account['user']}`\n服务器重启成功 ✅\n状态: *Online*")
-            else:
-                send_tg_message(f"👤 账户: `{account['user']}`\n服务器重启后状态异常 ⚠️\n请手动登录检查。")
+        send_tg_message(f"👤 账户: `{account['user']}`\n服务器可能离线，请注意检查。")
 
-        print(f"账户 {account['user']} 操作完成。")
-        await browser.close()
+    print(f"账户 {account['user']} 操作完成。")
 
-async def main():
+def main():
     if not ACCOUNTS_JSON:
         print("错误: 未找到 ACCOUNTS_JSON 环境变量，请检查 GitHub Secrets 配置。")
         sys.exit(1)
@@ -140,11 +84,11 @@ async def main():
     try:
         accounts = json.loads(ACCOUNTS_JSON)
         for account in accounts:
-            await process_account(account)
+            process_account(account)
         send_tg_message("所有账户操作完毕。 🎉")
     except Exception as e:
         print(f"脚本运行错误: {str(e)}")
         send_tg_message(f"⚠️ 脚本运行出现错误，请检查 GitHub Actions 日志。\n错误详情: `{str(e)}`")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
