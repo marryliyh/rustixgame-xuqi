@@ -11,7 +11,6 @@ if not node_link:
     sys.exit(1)
 
 def parse_link(link):
-    # GitHub Secret 里若粘贴了网页转义后的链接，把 &amp; 还原为 &。
     link = html.unescape(link.strip())
     parsed = urllib.parse.urlparse(link)
     scheme = parsed.scheme.lower()
@@ -81,7 +80,7 @@ def parse_link(link):
         host = parsed.hostname
         port = parsed.port or 443
         sni = get_q("sni") or host
-        insecure_value = (get_q("insecure") or get_q("allowInsecure")).strip().lower()
+        insecure_value = (get_q("insecure") or get_q("allowInsecure")).lower()
         insecure = insecure_value in ["1", "true", "yes"]
         
         outbound = {
@@ -117,8 +116,6 @@ def parse_link(link):
     else:
         raise Exception(f"暂不支持的协议类型: {scheme}")
 
-    if not outbound.get("server"):
-        raise Exception("节点链接缺少服务器地址")
     return outbound
 
 try:
@@ -127,8 +124,14 @@ try:
         "log": {"level": "info"},
         "inbounds": [
             {
-                "type": "mixed", # 💡 启用 mixed 模式，同时支持 HTTP (10809) 和 SOCKS5 (10808)
-                "tag": "mixed-in",
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": 10808
+            },
+            {
+                "type": "http",
+                "tag": "http-in",
                 "listen": "127.0.0.1",
                 "listen_port": 10809
             }
@@ -140,7 +143,7 @@ try:
     }
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    print("✅ 已成功写入 sing-box HTTP/Mixed 代理配置文件 (127.0.0.1:10809)！")
+    print("✅ 已成功写入 sing-box 代理配置文件 (SOCKS5 127.0.0.1:10808 / HTTP 127.0.0.1:10809)！")
 except Exception as e:
     print(f"❌ 解析 NODE_LINK 失败: {e}")
     sys.exit(1)
