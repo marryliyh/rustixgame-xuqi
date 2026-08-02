@@ -4,6 +4,8 @@ import os
 import json
 import sys
 import re
+import socket
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 # --- 从环境变量读取配置 ---
@@ -12,7 +14,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
 PROXY_URL = os.environ.get("PROXY_URL")
 
-# 直接访问你的特定服务器控制台页面
+# 直达你的特定服务器控制台页面
 CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
@@ -28,6 +30,18 @@ def send_tg_message(text):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"❌ [TG] 发送 Telegram 消息失败: {e}")
+
+def check_proxy_port(proxy_url):
+    """检测本地 SOCKS5/HTTP 代理端口是否在正常监听"""
+    try:
+        parsed = urlparse(proxy_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 10808
+        
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except Exception:
+        return False
 
 def format_cookies_for_playwright(raw_cookies):
     cleaned_cookies = []
@@ -86,9 +100,15 @@ async def run_automation():
             ]
         }
 
+        # 💡 核心修复：自动检测代理端口连通性
         if PROXY_URL:
-            print(f"🌐 正在通过代理访问: {PROXY_URL}")
-            launch_options["proxy"] = {"server": PROXY_URL}
+            if check_proxy_port(PROXY_URL):
+                print(f"🌐 代理端口服务正常，通过代理访问: {PROXY_URL}")
+                launch_options["proxy"] = {"server": PROXY_URL}
+            else:
+                print("⚠️ 本地代理端口未启动（未配置 NODE_LINK 或 sing-box 启动失败），自动降级为【直连模式】！")
+        else:
+            print("🌐 当前未配置代理，使用 GitHub Actions 默认直连网络...")
 
         browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
@@ -106,20 +126,19 @@ async def run_automation():
 
         page = await context.new_page()
 
-        # 带有重试机制的页面加载 (应对代理建立延迟)
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                print(f"🌐 直接访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
+                print(f"🌐 访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
                 await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=45000)
                 break
             except Exception as e:
-                print(f"⚠️ 页面访问延迟 ({e})，等待 5 秒后重试...")
+                print(f"⚠️ 页面加载延迟 ({e})，等待 5 秒重试...")
                 if attempt == max_retries - 1:
-                    raise Exception(f"通过代理连接控制台失败: {e}")
+                    raise Exception(f"连接控制台失败: {e}")
                 await asyncio.sleep(5)
 
-        # ⏳ 安全循环等待 WAF 响应与页面渲染
+        # ⏳ 等待 WAF 验证与 DOM 渲染
         print("⏳ 等待页面加载与 WAF 自动响应...")
         for _ in range(10):
             try:
@@ -130,7 +149,7 @@ async def run_automation():
                 pass
             await asyncio.sleep(2)
 
-        # 检查是否被 WAF 拦截或退回登录页
+        # 检查最终页面状态
         try:
             current_content = await page.content()
         except Exception:
@@ -138,7 +157,7 @@ async def run_automation():
 
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("代理 IP 被 Mitelis 防火墙拦截 (Access denied)。请尝试更换 Secret NODE_LINK 中的节点！")
+            raise Exception("IP 被 Mitelis 防火墙拦截 (Access denied)。请在 Secrets 配置有效的 `NODE_LINK` 代理节点！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
@@ -146,25 +165,25 @@ async def run_automation():
 
         print("✅ 防火墙与 Session 校验成功，已进入控制台！")
 
-        # 等待控制台按钮加载出来
+        # 等待按钮加载
         print("⏳ 等待控制台操作按钮渲染...")
         try:
             await page.wait_for_selector('button', timeout=20000)
         except Exception:
             print("⚠️ 按钮渲染等待超时，尝试直接定位 DOM...")
 
-        # 寻找 Старт (启动) 与 Рестарт (重启) 按钮
+        # 定位 Старт (启动) 与 Рестарт (重启) 按钮
         start_btn = page.locator('button').filter(has_text=re.compile(r'Старт|Start|开', re.IGNORECASE)).first
         restart_btn = page.locator('button').filter(has_text=re.compile(r'Рестарт|Restart|重', re.IGNORECASE)).first
 
-        # 获取页面纯文本进行状态判定
+        # 判断运行状态
         body_text = (await page.locator('body').inner_text()).lower()
         is_running = "включён" in body_text or "running" in body_text or "online" in body_text
 
         if is_running:
             print("🎉 服务器当前状态为:【Включён / 运行中】")
             if await restart_btn.count() > 0:
-                print("🚀 正在点击【Рестарт / 重启】按钮以维持服务状态...")
+                print("🚀 点击【Рестарт / 重启】按钮以维持服务器活跃...")
                 await restart_btn.click(timeout=10000)
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
@@ -174,9 +193,9 @@ async def run_automation():
                 await page.screenshot(path="after_click.png")
                 send_tg_message("🖥️ 服务器状态: *Включён (正常运行中)*\n💡 服务器正常运行中，无需额外操作。")
         else:
-            print("⚡ 服务器当前处于停止状态，正在提交启动指令...")
+            print("⚡ 服务器当前处于停止状态，准备开机...")
             if await start_btn.count() > 0:
-                print("🚀 正在点击【Старт / 开始】开机按钮...")
+                print("🚀 点击【Старт / 开始】开机按钮...")
                 await start_btn.click(timeout=10000)
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
