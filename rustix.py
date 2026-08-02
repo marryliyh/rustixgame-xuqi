@@ -102,7 +102,7 @@ async def run_automation():
             print(f"🌐 节点代理正常运行，正在通过 HTTP 隧道代理访问: {PROXY_URL}")
             launch_options["proxy"] = {"server": PROXY_URL}
         else:
-            raise Exception(f"本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
+            raise Exception("本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
 
         browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
@@ -133,7 +133,7 @@ async def run_automation():
                 await asyncio.sleep(5)
 
         print("⏳ 等待页面加载与 WAF 自动响应...")
-        for _ in range(12):
+        for _ in range(10):
             try:
                 content = await page.content()
                 if "Access denied" not in content and "Just a moment" not in content:
@@ -157,23 +157,26 @@ async def run_automation():
 
         print("✅ 防火墙与 Session 校验成功，已进入控制台！")
 
-        print("⏳ 等待控制台操作按钮渲染...")
-        try:
-            await page.wait_for_selector('button', timeout=20000)
-        except Exception:
-            print("⚠️ 按钮渲染等待超时，尝试直接定位 DOM...")
+        # 💡 核心修复：等待前端 React/Vue 组件与 WebSocket 握手渲染完成
+        print("⏳ 正在等待前端动态控制按钮及 WebSocket 状态渲染 (6秒)...")
+        await asyncio.sleep(6)
 
-        start_btn = page.locator('button').filter(has_text=re.compile(r'Старт|Start|开', re.IGNORECASE)).first
-        restart_btn = page.locator('button').filter(has_text=re.compile(r'Рестарт|Restart|重', re.IGNORECASE)).first
+        # 尝试寻找开机与重启按钮（覆盖俄语、英语及样式特征）
+        start_btn = page.locator('button, a').filter(has_text=re.compile(r'Старт|Start|Запустить|Запуск|开机|启动', re.IGNORECASE)).first
+        restart_btn = page.locator('button, a').filter(has_text=re.compile(r'Рестарт|Restart|Перезапуск|重启', re.IGNORECASE)).first
 
+        # 判断运行状态
         body_text = (await page.locator('body').inner_text()).lower()
-        is_running = "включён" in body_text or "running" in body_text or "online" in body_text
+        is_running = any(k in body_text for k in ["включён", "running", "online", "запущен", "运行"])
+
+        btn_clicked = False
 
         if is_running:
             print("🎉 服务器当前状态为:【Включён / 运行中】")
             if await restart_btn.count() > 0:
                 print("🚀 点击【Рестарт / 重启】按钮以维持服务器活跃...")
                 await restart_btn.click(timeout=10000)
+                btn_clicked = True
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
                 print("🎉 重启指令提交完成！")
@@ -181,11 +184,13 @@ async def run_automation():
             else:
                 await page.screenshot(path="after_click.png")
                 send_tg_message("🖥️ 服务器状态: Включён (正常运行中)\n💡 服务器正常运行中，无需额外操作。")
+                btn_clicked = True
         else:
             print("⚡ 服务器当前处于停止状态，准备开机...")
             if await start_btn.count() > 0:
                 print("🚀 点击【Старт / 开始】开机按钮...")
                 await start_btn.click(timeout=10000)
+                btn_clicked = True
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
                 print("🎉 开机指令提交完成！")
@@ -193,12 +198,27 @@ async def run_automation():
             elif await restart_btn.count() > 0:
                 print("🚀 未找到 Старт 按钮，尝试点击【Рестарт / 重启】按钮...")
                 await restart_btn.click(timeout=10000)
+                btn_clicked = True
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
                 send_tg_message("🖥️ 服务器状态: Рестарт (重启指令已发出 🚀)")
+
+        # 💡 通用兜底策略：如果上面的文本匹配失败，尝试通过 CSS 类名定位绿色的 Action 按钮
+        if not btn_clicked:
+            print("⚠️ 未能通过文字定位按钮，尝试通过样式选择器 (green/success/primary)...")
+            fallback_btn = page.locator('button.bg-green-600, button.bg-emerald-600, button[class*="success"], button[class*="primary"]').first
+            if await fallback_btn.count() > 0:
+                print("🚀 找到了控制台主操作按钮，正在点击...")
+                await fallback_btn.click(timeout=10000)
+                await asyncio.sleep(8)
+                await page.screenshot(path="after_click.png")
+                send_tg_message("🖥️ 服务器状态: 指令已提交 🚀\n💡 已成功通过样式定位并触发控制台操作按钮。")
             else:
+                # 打印所有按钮文本以便快速 Debug
+                buttons = await page.locator('button').all_inner_texts()
+                print(f"📊 页面当前找到的所有按钮文本: {buttons}")
                 await page.screenshot(path="button_not_found.png")
-                raise Exception("未能在控制台页面匹配到【Старт】或【Рестарт】按钮，截图已保存为 button_not_found.png。")
+                raise Exception(f"未能在控制台匹配到操作按钮！页面按钮列表: {buttons}")
 
         await browser.close()
 
