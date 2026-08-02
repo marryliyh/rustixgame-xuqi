@@ -47,10 +47,10 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
         run: xvfb-run --auto-servernum python rustix.py
 
-      # 📸 增加截图文件自动上传功能（无论脚本成功与否都会执行）
+      # 上传截图供排查
       - name: Upload Screenshots Artifact
         if: always()
         uses: actions/upload-artifact@v4
