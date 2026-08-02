@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
-PROXY_URL = os.environ.get("PROXY_URL")  # 可选：代理地址，如 http://127.0.0.1:7890 或 socks5://...
+PROXY_URL = os.environ.get("PROXY_URL")
 
 BASE_URL = "https://my.rustix.me/"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
@@ -32,8 +32,6 @@ def format_cookies_for_playwright(raw_cookies):
     cleaned_cookies = []
     for c in raw_cookies:
         name = c.get("name", "")
-        
-        # 剔除绑定了本机 IP 的 Mitelis WAF 校验 Cookie
         if name.startswith("mit_ck"):
             print(f"🧹 自动过滤与旧 IP 绑定的 WAF Cookie: {name}")
             continue
@@ -71,7 +69,7 @@ async def run_automation():
         raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
 
     print("\n==========================================")
-    print("🚀 开始通过 GitHub Actions 默认 IP 启动任务")
+    print("🚀 开始通过代理节点启动自动化任务")
     print("==========================================")
 
     async with async_playwright() as p:
@@ -87,7 +85,6 @@ async def run_automation():
             ]
         }
 
-        # 如果配置了自定义代理节点则接入
         if PROXY_URL:
             print(f"🌐 正在通过代理访问: {PROXY_URL}")
             launch_options["proxy"] = {"server": PROXY_URL}
@@ -110,23 +107,31 @@ async def run_automation():
 
         print(f"🌐 1/3 访问面板主页: {BASE_URL}")
         try:
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
-            print(f"⚠️ 页面加载超时: {e}")
+            print(f"⚠️ 页面首次加载提示 (可能在进行 WAF 挑战跳转): {e}")
 
-        # ⏳ 等待页面自动跳转/解密
+        # ⏳ 安全循环等待页面稳定，捕获并忽略跳转中的 navigation 异常
         print("⏳ 等待页面加载与 WAF 自动响应...")
-        for _ in range(8):
-            content = await page.content()
-            if "Access denied" not in content and "Just a moment" not in content:
-                break
+        for _ in range(10):
+            try:
+                content = await page.content()
+                if "Access denied" not in content and "Just a moment" not in content:
+                    break
+            except Exception:
+                # 页面正在导航/跳转时调用 content() 会抛异常，安全忽略并继续等待
+                pass
             await asyncio.sleep(2)
 
-        # 检查是否依旧拦截
-        current_content = await page.content()
+        # 检查最终页面内容
+        try:
+            current_content = await page.content()
+        except Exception:
+            current_content = ""
+
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("GitHub Actions 默认 IP 也被 Mitelis 防火墙拦截！建议配置 Secret `PROXY_URL` 传入自定义代理。")
+            raise Exception("代理节点的 IP 或请求被 Mitelis 防火墙拦截 (Access denied)。请尝试更换另一个节点链接！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
