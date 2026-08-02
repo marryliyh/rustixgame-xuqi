@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 解析节点并启动 sing-box 代理
+      # 解析节点并启动 sing-box 混合代理
       - name: Parse Node Link & Start Proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
@@ -51,12 +51,12 @@ jobs:
             echo ""
           fi
 
-      # 安装依赖
+      # 💡 安装 Firefox 引擎（彻底规避 Chromium 的 TLS 防火墙拦截）
       - name: Install dependencies & Xvfb
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
           pip install playwright requests
-          playwright install chromium
+          playwright install firefox
 
       # 运行主自动化脚本
       - name: Run script with Xvfb
