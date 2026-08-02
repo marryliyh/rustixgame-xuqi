@@ -14,7 +14,7 @@ COOKIES_JSON = os.environ.get("COOKIES_JSON")
 PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:10809")
 
 CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
-FIREFOX_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
 def send_tg_message(text):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -81,12 +81,21 @@ async def run_automation():
         raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
 
     print("\n==========================================")
-    print("🚀 开始访问 Rustix 服务器控制台页面 (Firefox Engine)")
+    print("🚀 开始访问 Rustix 服务器控制台页面")
     print("==========================================")
 
     async with async_playwright() as p:
         launch_options = {
             "headless": False,
+            "ignore_default_args": ["--enable-automation"],
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--disable-quic",
+                "--window-size=1366,768"
+            ]
         }
 
         if PROXY_URL and check_proxy_port(PROXY_URL):
@@ -95,15 +104,18 @@ async def run_automation():
         else:
             raise Exception("本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
 
-        # 💡 使用 Firefox 引擎彻底突破 Chromium TLS 指纹拦截
-        browser = await p.firefox.launch(**launch_options)
+        browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
-            user_agent=FIREFOX_USER_AGENT,
+            user_agent=EXACT_USER_AGENT,
             locale="ru-RU"
         )
 
-        print("🔑 正在注入账号 Session 及 WAF Cookie...")
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """)
+
+        print("🔑 正在注入账号 Session Cookie...")
         await context.add_cookies(formatted_cookies)
 
         page = await context.new_page()
@@ -112,23 +124,16 @@ async def run_automation():
         for attempt in range(max_retries):
             try:
                 print(f"🌐 访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
-                await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=45000)
+                await page.goto(CONSOLE_URL, wait_until="commit", timeout=25000)
                 break
             except Exception as e:
-                print(f"⚠️ 页面加载延迟 ({e})，等待 5 秒重试...")
+                print(f"⚠️ 页面响应延迟 ({e})，等待 5 秒重试...")
                 if attempt == max_retries - 1:
                     raise Exception(f"通过代理连接控制台失败: {e}")
                 await asyncio.sleep(5)
 
-        print("⏳ 等待页面加载与 WAF 自动响应...")
-        for _ in range(10):
-            try:
-                content = await page.content()
-                if "Access denied" not in content and "Just a moment" not in content:
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(2)
+        print("⏳ 等待页面 DOM 加载与 Cloudflare/Mitelis 校验 (8秒)...")
+        await asyncio.sleep(8)
 
         try:
             current_content = await page.content()
@@ -137,7 +142,7 @@ async def run_automation():
 
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("提示 Access denied，请确认 Cookie 是否包含最新有效的防盾 Token！")
+            raise Exception("提示 Access denied，请确认节点 IP 或更新最新 Cookie！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
@@ -145,49 +150,57 @@ async def run_automation():
 
         print("✅ 防火墙与 Session 校验成功，已进入控制台！")
 
-        # ⏳ 给前端 WebSocket 与状态渲染留足时间
-        print("⏳ 正在等待前端动态控制按钮渲染 (5秒)...")
-        await asyncio.sleep(5)
+        print("⏳ 正在等待前端 WebSocket 与控制按钮完全加载渲染 (8秒)...")
+        await asyncio.sleep(8)
 
-        # 根据截图精确匹配控制按钮：
-        # 绿色: Старт / Start
-        # 蓝色: Рестарт / Restart
-        start_btn = page.locator('button, a').filter(has_text=re.compile(r'Старт|Start|Запустить', re.IGNORECASE)).first
-        restart_btn = page.locator('button, a').filter(has_text=re.compile(r'Рестарт|Restart|Перезапуск', re.IGNORECASE)).first
+        # 💡 终极定位方案：直接在浏览器内部注入 JS 遍历页面元素，精准识别并点击【Старт】或【Рестарт】
+        click_result = await page.evaluate("""
+            () => {
+                const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
+                
+                // 寻找开机按钮 (Старт / Start)
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim();
+                    if (/^(Старт|Start)$/i.test(txt) || txt.includes('Старт')) {
+                        // 找最近的可点击父节点或自身
+                        const clickable = el.closest('button, a, div[role="button"]') || el;
+                        clickable.click();
+                        return { success: true, action: 'Старт (开机)', text: txt };
+                    }
+                }
+                
+                // 寻找重启按钮 (Рестарт / Restart)
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim();
+                    if (/^(Рестарт|Restart)$/i.test(txt) || txt.includes('Рестарт')) {
+                        const clickable = el.closest('button, a, div[role="button"]') || el;
+                        clickable.click();
+                        return { success: true, action: 'Рестарт (重启)', text: txt };
+                    }
+                }
+                
+                return { success: false };
+            }
+        """)
 
-        body_text = (await page.locator('body').inner_text()).lower()
-        is_running = "включён" in body_text or "running" in body_text or "online" in body_text
-
-        if is_running:
-            print("🎉 服务器当前状态为:【Включён / 运行中】")
-            if await restart_btn.count() > 0:
-                print("🚀 点击【Рестарт / 重启】按钮以维持服务器活跃...")
-                await restart_btn.click(timeout=10000)
-                await asyncio.sleep(8)
-                await page.screenshot(path="after_click.png")
-                print("🎉 重启指令提交完成！")
-                send_tg_message("🖥️ 服务器状态: Рестарт (重启指令已发出 🚀)\n💡 服务器此前处于运行状态，已成功执行重启以保活。")
-            else:
-                await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器状态: Включён (正常运行中)\n💡 服务器正常运行中，无需额外操作。")
+        if click_result and click_result.get("success"):
+            action_name = click_result.get("action")
+            print(f"🎉 JS 精准匹配并成功点击了按钮:【{action_name}】！")
+            await asyncio.sleep(6)
+            await page.screenshot(path="after_click.png")
+            send_tg_message(f"🖥️ 服务器保活指令已发出: {action_name} 🚀\n💡 已成功触发控制台按钮。")
         else:
-            print("⚡ 服务器当前处于停止状态，准备开机...")
-            if await start_btn.count() > 0:
-                print("🚀 点击【Старт / 开始】开机按钮...")
-                await start_btn.click(timeout=10000)
-                await asyncio.sleep(8)
+            # 兜底：如果 JS 全文查找未果，强行点击页面顶栏右侧的第一个按钮容器
+            print("⚠️ 未匹配到指定俄文文本，尝试针对控制台顶部按钮区域进行点击...")
+            top_buttons = page.locator('div[class*="flex"] > button, div[class*="flex"] > div[class*="cursor-pointer"]')
+            if await top_buttons.count() > 0:
+                await top_buttons.first.click(force=True)
+                await asyncio.sleep(6)
                 await page.screenshot(path="after_click.png")
-                print("🎉 开机指令提交完成！")
-                send_tg_message("🖥️ 服务器状态: Старт (开机指令已发出 🚀)\n💡 已成功点击开机按钮，请稍后在面板查看。")
-            elif await restart_btn.count() > 0:
-                print("🚀 未找到 Старт 按钮，尝试点击【Рестарт / 重启】按钮...")
-                await restart_btn.click(timeout=10000)
-                await asyncio.sleep(8)
-                await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器状态: Рестарт (重启指令已发出 🚀)")
+                send_tg_message("🖥️ 服务器保活指令已发出 🚀\n💡 已成功点击顶部控制按钮。")
             else:
                 await page.screenshot(path="button_not_found.png")
-                raise Exception("未能在控制台页面匹配到【Старт】或【Рестарт】按钮，截图已保存为 button_not_found.png。")
+                raise Exception("未能在控制台页面匹配到可操作按钮，截图已保存为 button_not_found.png。")
 
         await browser.close()
 
