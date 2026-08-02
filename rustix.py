@@ -8,13 +8,11 @@ import socket
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
-# --- 从环境变量读取配置 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
 PROXY_URL = os.environ.get("PROXY_URL")
 
-# 直达你的特定服务器控制台页面
 CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
@@ -24,20 +22,25 @@ def send_tg_message(text):
         return
         
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    formatted_text = f"*✅ rustix.me 服务器自动启动/保活通知*\n\n{text}"
-    payload = {"chat_id": TG_CHAT_ID, "text": formatted_text, "parse_mode": "Markdown"}
+    # 💡 修复：移除 parse_mode 校验，改用纯文本推送，防止特殊字符导致 Telegram API 报 400 错而无法推送
+    payload = {
+        "chat_id": TG_CHAT_ID, 
+        "text": f"✅ rustix.me 服务器自动启动/保活通知\n\n{text}"
+    }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"❌ [TG] 发送 Telegram 消息失败: Status {res.status_code}, Response: {res.text}")
+        else:
+            print("✅ [TG] Telegram 通知已成功发送！")
     except Exception as e:
-        print(f"❌ [TG] 发送 Telegram 消息失败: {e}")
+        print(f"❌ [TG] 发送 Telegram 消息异常: {e}")
 
 def check_proxy_port(proxy_url):
-    """检测本地 SOCKS5/HTTP 代理端口是否在正常监听"""
     try:
         parsed = urlparse(proxy_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 10808
-        
         with socket.create_connection((host, port), timeout=2):
             return True
     except Exception:
@@ -100,15 +103,11 @@ async def run_automation():
             ]
         }
 
-        # 💡 核心修复：自动检测代理端口连通性
-        if PROXY_URL:
-            if check_proxy_port(PROXY_URL):
-                print(f"🌐 代理端口服务正常，通过代理访问: {PROXY_URL}")
-                launch_options["proxy"] = {"server": PROXY_URL}
-            else:
-                print("⚠️ 本地代理端口未启动（未配置 NODE_LINK 或 sing-box 启动失败），自动降级为【直连模式】！")
+        if PROXY_URL and check_proxy_port(PROXY_URL):
+            print(f"🌐 节点代理正常运行，正在通过代理访问: {PROXY_URL}")
+            launch_options["proxy"] = {"server": PROXY_URL}
         else:
-            print("🌐 当前未配置代理，使用 GitHub Actions 默认直连网络...")
+            raise Exception("本地 sing-box 节点代理未正常启动 (127.0.0.1:10808 端口未连通)！请检查 Secrets 中的 NODE_LINK 是否正确。")
 
         browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
@@ -135,10 +134,9 @@ async def run_automation():
             except Exception as e:
                 print(f"⚠️ 页面加载延迟 ({e})，等待 5 秒重试...")
                 if attempt == max_retries - 1:
-                    raise Exception(f"连接控制台失败: {e}")
+                    raise Exception(f"通过代理连接控制台失败: {e}")
                 await asyncio.sleep(5)
 
-        # ⏳ 等待 WAF 验证与 DOM 渲染
         print("⏳ 等待页面加载与 WAF 自动响应...")
         for _ in range(10):
             try:
@@ -149,7 +147,6 @@ async def run_automation():
                 pass
             await asyncio.sleep(2)
 
-        # 检查最终页面状态
         try:
             current_content = await page.content()
         except Exception:
@@ -157,7 +154,7 @@ async def run_automation():
 
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("IP 被 Mitelis 防火墙拦截 (Access denied)。请在 Secrets 配置有效的 `NODE_LINK` 代理节点！")
+            raise Exception("通过代理访问依然提示 Access denied，请在面板确认该节点 IP 是否依然可用！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
@@ -165,18 +162,15 @@ async def run_automation():
 
         print("✅ 防火墙与 Session 校验成功，已进入控制台！")
 
-        # 等待按钮加载
         print("⏳ 等待控制台操作按钮渲染...")
         try:
             await page.wait_for_selector('button', timeout=20000)
         except Exception:
             print("⚠️ 按钮渲染等待超时，尝试直接定位 DOM...")
 
-        # 定位 Старт (启动) 与 Рестарт (重启) 按钮
         start_btn = page.locator('button').filter(has_text=re.compile(r'Старт|Start|开', re.IGNORECASE)).first
         restart_btn = page.locator('button').filter(has_text=re.compile(r'Рестарт|Restart|重', re.IGNORECASE)).first
 
-        # 判断运行状态
         body_text = (await page.locator('body').inner_text()).lower()
         is_running = "включён" in body_text or "running" in body_text or "online" in body_text
 
@@ -188,10 +182,10 @@ async def run_automation():
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
                 print("🎉 重启指令提交完成！")
-                send_tg_message("🖥️ 服务器状态: *Рестарт (重启指令已发出 🚀)*\n💡 服务器此前处于运行状态，已成功执行重启以保活。")
+                send_tg_message("🖥️ 服务器状态: Рестарт (重启指令已发出 🚀)\n💡 服务器此前处于运行状态，已成功执行重启以保活。")
             else:
                 await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器状态: *Включён (正常运行中)*\n💡 服务器正常运行中，无需额外操作。")
+                send_tg_message("🖥️ 服务器状态: Включён (正常运行中)\n💡 服务器正常运行中，无需额外操作。")
         else:
             print("⚡ 服务器当前处于停止状态，准备开机...")
             if await start_btn.count() > 0:
@@ -200,16 +194,16 @@ async def run_automation():
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
                 print("🎉 开机指令提交完成！")
-                send_tg_message("🖥️ 服务器状态: *Старт (开机指令已发出 🚀)*\n💡 已成功点击开机按钮，请稍后在面板查看。")
+                send_tg_message("🖥️ 服务器状态: Старт (开机指令已发出 🚀)\n💡 已成功点击开机按钮，请稍后在面板查看。")
             elif await restart_btn.count() > 0:
                 print("🚀 未找到 Старт 按钮，尝试点击【Рестарт / 重启】按钮...")
                 await restart_btn.click(timeout=10000)
                 await asyncio.sleep(8)
                 await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器状态: *Рестарт (重启指令已发出 🚀)*")
+                send_tg_message("🖥️ 服务器状态: Рестарт (重启指令已发出 🚀)")
             else:
                 await page.screenshot(path="button_not_found.png")
-                raise Exception("未能在控制台页面匹配到【Старт】或【Рестарт】按钮，截图已保存为 `button_not_found.png`。")
+                raise Exception("未能在控制台页面匹配到【Старт】或【Рестарт】按钮，截图已保存为 button_not_found.png。")
 
         await browser.close()
 
@@ -219,7 +213,7 @@ async def main():
     except Exception as e:
         error_msg = str(e)
         print(f"\n❌ 脚本运行出错: {error_msg}")
-        send_tg_message(f"⚠️ *脚本运行出现错误！*\n\n错误详情:\n`{error_msg}`")
+        send_tg_message(f"⚠️ 脚本运行出现错误！\n\n错误详情:\n{error_msg}")
         sys.exit(1)
 
 if __name__ == "__main__":
