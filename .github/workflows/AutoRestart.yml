@@ -51,12 +51,12 @@ jobs:
             echo ""
           fi
 
-      # 💡 安装 Firefox 引擎（彻底规避 Chromium 的 TLS 防火墙拦截）
-      - name: Install dependencies & Xvfb
+      # 💡 关键修复：强制下载 Chromium 内核及 Linux 系统底层依赖
+      - name: Install dependencies & Chromium Browser
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
           pip install playwright requests
-          playwright install firefox
+          playwright install --with-deps chromium
 
       # 运行主自动化脚本
       - name: Run script with Xvfb
