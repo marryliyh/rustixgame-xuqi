@@ -3,6 +3,7 @@ import requests
 import os
 import json
 import sys
+import re
 from playwright.async_api import async_playwright
 
 # --- 从环境变量读取敏感信息 ---
@@ -14,6 +15,7 @@ BASE_URL = "https://my.rustix.me/"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
 def send_tg_message(text):
+    """发送带 Markdown 格式的 Telegram 消息"""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("💡 [TG] TG_TOKEN 或 TG_CHAT_ID 未配置，跳过 Telegram 通知。")
         return
@@ -53,15 +55,13 @@ def format_cookies_for_playwright(raw_cookies):
 
 async def run_automation():
     if not COOKIES_JSON:
-        print("❌ 错误: 未配置 COOKIES_JSON 环境变量。")
-        sys.exit(1)
+        raise Exception("未配置 COOKIES_JSON 环境变量，请检查 GitHub Secrets 配置！")
 
     try:
         raw_cookies = json.loads(COOKIES_JSON)
         formatted_cookies = format_cookies_for_playwright(raw_cookies)
     except Exception as e:
-        print(f"❌ Cookie JSON 解析失败: {e}")
-        sys.exit(1)
+        raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
 
     print("\n==========================================")
     print("🚀 开始通过 Cookie 免登录启动服务器")
@@ -98,69 +98,85 @@ async def run_automation():
         try:
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"⚠️ 页面打开慢，继续尝试: {e}")
+            print(f"⚠️ 页面加载超时或较慢: {e}")
 
-        await asyncio.sleep(4)
-
+        # 检查凭证是否失效
+        await asyncio.sleep(3)
         if "login" in page.url or "auth" in page.url:
-            print("❌ Cookie 已失效，重定向回了登录页！")
-            await page.screenshot(path="cloudflare_block.png")
-            raise Exception("Cookie 已失效，请在浏览器重新导出 Cookie！")
+            await page.screenshot(path="login_failed.png")
+            raise Exception("Cookie 已失效，面板将其重定向回了登录页，请在浏览器重新导出最新 Cookie！")
 
-        print("✅ 登录凭证有效，已成功进入后台！")
+        print("✅ Cookie 验证成功，已成功进入后台！")
 
-        # 2. 从服务器列表进入控制台
-        print("🌐 2/3 正在匹配并进入服务器控制台...")
-        
-        # 匹配 Pterodactyl 架构面板的服务器链接 (例如包含 /server/ 的卡片)
-        server_link = await page.query_selector('a[href*="/server/"]')
-        if not server_link:
-            # 备用选择器：点击包含 jack 名字的服务器卡片
-            server_link = await page.query_selector('text=jack') or await page.query_selector('div[class*="server"]')
-
-        if server_link:
-            print("✅ 找到服务器列表项，点击进入控制台...")
-            await server_link.click()
-            await asyncio.sleep(5)
-        else:
-            print("ℹ️ 未在首页匹配到服务器链接，可能已直接处于控制台页面，继续检测按钮...")
-
-        # 3. 检查并点击【Старт】绿色开机按钮
-        print("🔍 3/3 正在定位控制台【Старт / 开始】按钮...")
-        
-        start_btn = None
+        print("⏳ 等待面板 API 异步渲染服务器数据...")
         try:
-            # 优先精准寻找包含 Старт / Start 的按钮
-            start_btn_locator = page.locator('button:has-text("Старт"), button:has-text("Start")').first
-            await start_btn_locator.wait_for(state="visible", timeout=15000)
-            start_btn = start_btn_locator
+            # 智能等待服务器卡片或控制台按钮加载出来
+            await page.wait_for_selector('a[href*="/server/"], button', timeout=20000)
         except Exception:
-            print("⚠️ 未直接找到绿色 [Старт] 按钮，尝试保底匹配方式...")
+            print("⚠️ 页面渲染等待超时，尝试直接分析当前页面 DOM...")
 
-        # 再次获取页面内文本确认当前运行状态
-        page_text = (await page.locator('body').inner_text()).lower()
+        # 2. 如果还在服务器列表页，寻找卡片点击进入
+        if "/server/" not in page.url:
+            print("🌐 2/3 处于服务器列表页，准备点击进入控制台...")
+            
+            # 使用 Playwright Locator 匹配服务器卡片/链接（支持 Shadow DOM）
+            server_card = page.locator('a[href*="/server/"]').first
+            if await server_card.count() == 0:
+                server_card = page.locator('text=jack').first
 
-        if "включён" in page_text or "online" in page_text or "running" in page_text:
-            print("🎉 服务器当前已经是【Включён / 运行中】状态，无需重复启动。")
-            send_tg_message("🖥️ 服务器状态: *Включён (运行中)*\n💡 操作结果: 检查完成，服务器正在正常运行。")
-        else:
-            if start_btn:
-                await start_btn.click()
-                print("🚀 已成功点击绿色【Старт】开机按钮！")
+            if await server_card.count() > 0:
+                print("✅ 匹配到服务器卡片，正在点击进入...")
+                await server_card.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(5)
             else:
-                # 最后的保底强制点击
-                await page.click('//button[contains(., "Старт") or contains(., "Start")]')
-                print("🚀 保底选择器：已点击开机按钮！")
+                print("ℹ️ 未能找到服务器卡片，尝试直接在当前页面寻找控制按键...")
+        else:
+            print("✅ 当前已直接位于服务器控制台页面。")
 
-            print("⏳ 等待 10 秒确认状态...")
-            await asyncio.sleep(10)
+        # 3. 定位开机按钮 (弃用 XPath，使用原生 Locator 穿透 Shadow DOM)
+        print("🔍 3/3 正在定位【Старт / 开始】按钮...")
 
-            # 再次截图保存状态
-            await page.screenshot(path="after_start.png")
+        # 使用正则忽略大小写匹配 Старт / Start / 开始
+        start_btn = page.locator('button').filter(has_text=re.compile(r'Старт|Start|开始', re.IGNORECASE)).first
+
+        # 保底匹配：如果找到带图标的绿色按钮
+        if await start_btn.count() == 0:
+            start_btn = page.locator('button.bg-green-600, button.btn-success').first
+
+        # 校验按钮是否存在
+        btn_count = await start_btn.count()
+        if btn_count == 0:
+            await page.screenshot(path="button_not_found.png")
+            raise Exception("在控制台页面未能找到【Старт / 开始】按钮，截图已保存为 `button_not_found.png`。")
+
+        # 判断当前运行状态
+        page_text = (await page.locator('body').inner_text()).lower()
+        if "включён" in page_text or "running" in page_text or "online" in page_text:
+            print("🎉 服务器当前已经是【Включён / 运行中】状态！")
+            send_tg_message("🖥️ 服务器状态: *Включён (运行中)*\n💡 检查完成，服务器当前正在正常运行中，无需重复开机。")
+        else:
+            print("🚀 正在点击【Старт】开机按钮...")
+            await start_btn.click(timeout=10000)
+            await asyncio.sleep(8)
+            
+            # 保存执行后的截图
+            await page.screenshot(path="after_click.png")
             print("🎉 开机指令已成功提交！")
-            send_tg_message("🖥️ 服务器状态: *开机指令已成功发出 🚀*\n💡 服务器正在启动中。")
+            send_tg_message("🖥️ 服务器状态: *开机指令已成功发出 🚀*\n💡 正在后台初始化开机，请稍后在面板查看。")
 
         await browser.close()
 
+async def main():
+    """主入口：包含全局异常捕获，确保报错时 100% 发送 Telegram 通知"""
+    try:
+        await run_automation()
+    except Exception as e:
+        error_msg = str(e)
+        print(f"\n❌ 脚本运行出错: {error_msg}")
+        # 全局保底通知
+        send_tg_message(f"⚠️ *脚本运行出现错误！*\n\n错误详情:\n`{error_msg}`")
+        sys.exit(1)
+
 if __name__ == "__main__":
-    asyncio.run(run_automation())
+    asyncio.run(main())
