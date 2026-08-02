@@ -8,10 +8,11 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       actions: write
       contents: read
-      
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,67 +22,68 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 解析节点并启动 sing-box 混合代理
-      - name: Parse Node Link & Start Proxy
+      - name: Install sing-box and start proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          if [ -z "$NODE_LINK" ]; then
-            echo "❌ 错误: 未在仓库 Secrets 配置 NODE_LINK！"
-            exit 1
-          else
-            echo "📥 下载 sing-box 内核..."
-            curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz | tar -xz
-            mv sing-box-*/sing-box ./sing-box
-            chmod +x ./sing-box
+          set -euo pipefail
+          test -n "$NODE_LINK" || { echo "NODE_LINK 未配置"; exit 1; }
+          curl -fL --retry 3 -o sing-box.tar.gz             https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box.tar.gz
+          mv sing-box-*/sing-box ./sing-box
+          chmod +x ./sing-box
+          python parse_node.py
+          ./sing-box check -c config.json
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          sleep 8
+          kill -0 "$(cat singbox.pid)" || { cat singbox.log; exit 1; }
+          cat singbox.log || true
 
-            echo "⚡ 解析节点链接..."
-            python parse_node.py
-
-            echo "🚀 启动后台代理 (127.0.0.1:10809)..."
-            ./sing-box run -c config.json > singbox.log 2>&1 &
-            sleep 5
-            
-            echo "📊 --- sing-box 启动日志 ---"
-            cat singbox.log || true
-            echo "---------------------------"
-
-            echo "🌐 测试节点代理连通性："
-            curl -x http://127.0.0.1:10809 -s https://api.ipify.org || echo "⚠️ 代理端口尚未成功建立连接"
-            echo ""
-          fi
-
-      # 💡 关键修复：强制下载 Chromium 内核及 Linux 系统底层依赖
-      - name: Install dependencies & Chromium Browser
+      - name: Verify proxy path
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb
+          set -o pipefail
+          echo "===== 出口 IP ====="
+          curl --socks5-hostname 127.0.0.1:10808 --connect-timeout 15 --max-time 30             -fsS https://api.ipify.org && echo
+          echo "===== Rustix HTTPS ====="
+          curl --socks5-hostname 127.0.0.1:10808 --connect-timeout 20 --max-time 40             -sS -D rustix_headers.txt -o rustix_probe.html https://my.rustix.me/ || {
+              echo "Rustix HTTPS 预检失败";
+              cat singbox.log || true;
+              exit 1;
+            }
+          head -n 20 rustix_headers.txt || true
+
+      - name: Install Playwright Chromium
+        run: |
           pip install playwright requests
           playwright install --with-deps chromium
 
-      # 运行主自动化脚本
-      - name: Run script with Xvfb
+      - name: Run Rustix automation
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
-          PROXY_URL: http://127.0.0.1:10809
-        run: xvfb-run --auto-servernum python rustix.py
+          PROXY_URL: socks5://127.0.0.1:10808
+        run: python rustix.py
 
-      # 上传截图与日志
-      - name: Upload Artifacts
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-artifacts
+          name: rustix-run-${{ github.run_number }}
+          if-no-files-found: ignore
           path: |
             *.png
+            *.html
+            *.txt
             singbox.log
+            config.json
 
-      # 清理历史运行记录
       - name: Delete old workflow runs
+        if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           retain_days: 0
-          keep_minimum_runs: 1
+          keep_minimum_runs: 2
