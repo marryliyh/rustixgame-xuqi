@@ -5,13 +5,19 @@ import json
 import sys
 from playwright.async_api import async_playwright
 
+# --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
-ACCOUNTS_JSON = os.environ.get("ACCOUNTS_JSON")
+COOKIES_JSON = os.environ.get("COOKIES_JSON")
 
-LOGIN_URL = "https://my.rustix.me/auth/login"
+# 有 Cookie 后直接访问控制台主页，不要去 /auth/login
+BASE_URL = "https://my.rustix.me/"
+
+# ⚠️ 必须与你导出 Cookie 时的浏览器 User-Agent 完全一致，避免触发 Mitelis 防火墙校验
+EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
 def send_tg_message(text):
+    """发送带 Markdown 格式的 Telegram 消息"""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("💡 [TG] TG_TOKEN 或 TG_CHAT_ID 未配置，跳过 Telegram 通知。")
         return
@@ -24,34 +30,49 @@ def send_tg_message(text):
     except Exception as e:
         print(f"❌ [TG] 发送 Telegram 消息失败: {e}")
 
-async def auto_click_cloudflare(page):
-    """尝试自动定位并点击 Cloudflare Turnstile 复选框"""
-    print("🔍 正在检查是否存在 Cloudflare 人机验证框...")
-    for _ in range(5):
-        try:
-            # 尝试查找 Cloudflare iframe
-            frames = page.frames
-            for frame in frames:
-                if "cloudflare.com" in frame.url or "challenges" in frame.url:
-                    print("⚡ 发现 Cloudflare 验证 Frame，尝试寻找点击目标...")
-                    checkbox = frame.locator('input[type="checkbox"], .cb-i, #challenge-stage')
-                    if await checkbox.count() > 0:
-                        await checkbox.first.click()
-                        print("✅ 已成功尝试点击 Cloudflare 复选框！")
-                        await asyncio.sleep(4)
-                        return True
-        except Exception:
-            pass
-        await asyncio.sleep(2)
-    return False
+def format_cookies_for_playwright(raw_cookies):
+    """清洗 Cookie-Editor 导出的 Cookie 格式以兼容 Playwright"""
+    cleaned_cookies = []
+    for c in raw_cookies:
+        cookie = {
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "domain": c.get("domain"),
+            "path": c.get("path", "/"),
+            "secure": c.get("secure", True),
+            "httpOnly": c.get("httpOnly", False)
+        }
+        # 处理 SameSite 映射
+        same_site = str(c.get("sameSite", "")).lower()
+        if same_site in ["no_restriction", "none"]:
+            cookie["sameSite"] = "None"
+        elif same_site == "lax":
+            cookie["sameSite"] = "Lax"
+        elif same_site == "strict":
+            cookie["sameSite"] = "Strict"
+            
+        # 转换过期时间
+        if "expirationDate" in c:
+            cookie["expires"] = int(c["expirationDate"])
+            
+        cleaned_cookies.append(cookie)
+    return cleaned_cookies
 
-async def process_account(account):
-    user_email = account.get("user")
-    user_pwd = account.get("pwd")
-    
-    print(f"\n==========================================")
-    print(f"🚀 开始处理账户: {user_email}")
-    print(f"==========================================")
+async def run_automation():
+    if not COOKIES_JSON:
+        print("❌ 错误: 未配置 COOKIES_JSON 环境变量，请检查 GitHub Secrets。")
+        sys.exit(1)
+
+    try:
+        raw_cookies = json.loads(COOKIES_JSON)
+        formatted_cookies = format_cookies_for_playwright(raw_cookies)
+    except Exception as e:
+        print(f"❌ Cookie JSON 解析失败: {e}")
+        sys.exit(1)
+
+    print("\n==========================================")
+    print("🚀 开始通过免登录 Cookie 凭证处理任务")
+    print("==========================================")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -67,69 +88,41 @@ async def process_account(account):
         )
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=EXACT_USER_AGENT,
             locale="ru-RU"
         )
 
+        # 擦除 webdriver 自动化标记
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
-            window.chrome = { runtime: {} };
         """)
+
+        # 1. 注入 Cookie
+        print("🔑 正在向浏览器 Context 注入 Cookie 凭证...")
+        await context.add_cookies(formatted_cookies)
 
         page = await context.new_page()
 
-        print(f"🌐 1/4 打开登录页面: {LOGIN_URL}")
+        # 2. 直接访问主页面板
+        print(f"🌐 1/3 正在使用 Session 访问主页: {BASE_URL}")
         try:
-            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            print(f"⚠️ 页面加载超时或异常，尝试继续: {e}")
+            await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+        except Exception:
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 尝试自动点击 CF 验证框
-        await auto_click_cloudflare(page)
+        await asyncio.sleep(5)
 
-        print("⏳ 等待页面与 Cloudflare 验证加载完成...")
-        
-        # 轮询等待登录框（最长 45 秒）
-        login_input_found = False
-        for i in range(9):
-            email_input = await page.query_selector('input[type="text"], input[type="email"], input[name="username"], input[name="email"]')
-            pwd_input = await page.query_selector('input[type="password"]')
-            if email_input and pwd_input:
-                login_input_found = True
-                print("✅ 已成功定位到登录输入框！")
-                break
-            
-            # 再次尝试点击 CF 验证
-            await auto_click_cloudflare(page)
-            await asyncio.sleep(5)
-
-        if not login_input_found:
-            print("❌ 未能成功找到登录框，正在保存页面截图 cloudflare_block.png ...")
+        # 检查是否成功处于登录状态（判断 URL 或页面内容）
+        current_url = page.url
+        if "login" in current_url or "auth" in current_url:
+            print("❌ Cookie 已失效或指纹未匹配，被重定向回了登录页面！")
             await page.screenshot(path="cloudflare_block.png")
-            raise Exception("登录输入框寻找超时，可能依然卡在 Cloudflare 人机验证页面。")
+            raise Exception("Cookie 登录凭证失效，请重新导出最新的 Cookie。")
 
-        email_input = await page.query_selector('input[type="text"], input[type="email"], input[name="username"], input[name="email"], form input:nth-of-type(1)')
-        pwd_input = await page.query_selector('input[type="password"]')
+        print("✅ 成功跳过登录界面进入后台！")
 
-        print("🔑 正在输入账号密码登录...")
-        await email_input.fill("")
-        await email_input.type(user_email, delay=50)
-        await pwd_input.fill("")
-        await pwd_input.type(user_pwd, delay=50)
-        await asyncio.sleep(1)
-
-        login_btn = await page.query_selector('button[type="submit"], button:has-text("Войти"), button:has-text("Login"), button:has-text("Вход"), form button')
-        if login_btn:
-            await login_btn.click()
-        else:
-            await page.keyboard.press("Enter")
-
-        print("⏳ 登录完成，等待跳转面板...")
-        await asyncio.sleep(6)
-
-        print("🌐 2/4 正在访问服务器列表并准备进入管理控制台...")
+        # 3. 查找并管理服务器
+        print("🌐 2/3 正在匹配管理服务器按钮...")
         manage_btn = await page.query_selector('text=Управлять сервером, text=管理服务器, a[href*="/server/"]')
         if manage_btn:
             await manage_btn.click()
@@ -138,7 +131,8 @@ async def process_account(account):
         else:
             print("ℹ️ 未能匹配到 [Управлять сервером] 按钮，尝试直接检测控制台组件...")
 
-        print("🔍 3/4 正在检查服务器控制台状态...")
+        # 4. 检测控制台及运行状态
+        print("🔍 3/3 正在检查服务器控制台状态...")
         try:
             await page.wait_for_selector('text=Консоль, text=Console, text=Старт, text=Рестарт', timeout=30000)
         except Exception:
@@ -148,9 +142,10 @@ async def process_account(account):
         await asyncio.sleep(2)
         page_text = (await page.locator('body').inner_text()).lower()
 
+        # 根据俄语面板状态判断
         if "включён" in page_text or "online" in page_text or "running" in page_text:
             print("🎉 服务器当前状态：【Включён / 运行中】")
-            send_tg_message(f"👤 账户: `{user_email}`\n🖥️ 服务器状态: *Включён (运行中)*\n💡 操作结果: 无需重复启动。")
+            send_tg_message("🖥️ 服务器状态: *Включён (运行中)*\n💡 操作结果: 免登录续据/状态正常，无需重复启动。")
         else:
             print("⚠️ 服务器当前状态：【Отключён / 已关机】，准备发送启动指令...")
             
@@ -168,6 +163,7 @@ async def process_account(account):
                 except Exception as e:
                     print(f"⚠️ 保底点击未成功: {e}")
 
+            # 处理二次确认弹窗
             await asyncio.sleep(2)
             confirm_btn = await page.query_selector("//button[contains(text(), '确认') or contains(text(), 'Yes') or contains(text(), 'Да')]")
             if confirm_btn:
@@ -180,27 +176,13 @@ async def process_account(account):
             new_text = (await page.locator('body').inner_text()).lower()
             if "включён" in new_text or "online" in new_text or "running" in new_text or "запуск" in new_text:
                 print("🎉 服务器成功启动！状态已更新为 Включён")
-                send_tg_message(f"👤 账户: `{user_email}`\n🖥️ 服务器状态: *已成功从 Отключён 启动 ✅*\n🚀 当前状态: Включён (运行中)")
+                send_tg_message("🖥️ 服务器状态: *已成功从 Отключён 启动 ✅*\n🚀 当前状态: Включён (运行中)")
             else:
                 print("💡 已成功触发启动点击，服务器正在后台初始化开机...")
-                send_tg_message(f"👤 账户: `{user_email}`\n🖥️ 服务器状态: *启动指令已发出 🚀*\n💡 请稍后在面板手动查看。")
+                send_tg_message("🖥️ 服务器状态: *启动指令已发出 🚀*\n💡 请稍后在面板手动查看。")
 
-        print(f"✅ 账户 {user_email} 处理完毕。")
+        print("✅ 处理完毕。")
         await browser.close()
 
-async def main():
-    if not ACCOUNTS_JSON:
-        print("错误: 未找到 ACCOUNTS_JSON 环境变量，请检查 GitHub Secrets 配置。")
-        sys.exit(1)
-
-    try:
-        accounts = json.loads(ACCOUNTS_JSON)
-        for account in accounts:
-            await process_account(account)
-        send_tg_message("所有账户自动开机/检测轮询完毕。 🎉")
-    except Exception as e:
-        print(f"脚本运行错误: {str(e)}")
-        send_tg_message(f"⚠️ 脚本运行出现错误，请检查 GitHub Actions 日志。\n错误详情: `{str(e)}`")
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_automation())
