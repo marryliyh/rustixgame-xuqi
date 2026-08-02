@@ -31,8 +31,15 @@ def send_tg_message(text):
 def format_cookies_for_playwright(raw_cookies):
     cleaned_cookies = []
     for c in raw_cookies:
+        name = c.get("name", "")
+        
+        # 💡 核心修复：剔除绑定了本机 IP 的 Mitelis WAF 校验 Cookie
+        if name.startswith("mit_ck"):
+            print(f"🧹 自动过滤与旧 IP 绑定的 WAF Cookie: {name}")
+            continue
+
         cookie = {
-            "name": c.get("name"),
+            "name": name,
             "value": c.get("value"),
             "domain": c.get("domain"),
             "path": c.get("path", "/"),
@@ -89,7 +96,7 @@ async def run_automation():
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
 
-        print("🔑 正在注入 Cookie 凭证...")
+        print("🔑 正在注入账号 Session Cookie...")
         await context.add_cookies(formatted_cookies)
 
         page = await context.new_page()
@@ -98,28 +105,38 @@ async def run_automation():
         try:
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"⚠️ 页面加载超时或较慢: {e}")
+            print(f"⚠️ 页面加载较慢: {e}")
+
+        # ⏳ 给 Mitelis 防火墙 5-8 秒时间在 Actions 的新 IP 上完成 JS 挑战和自动重定向
+        print("⏳ 等待 Mitelis WAF 完成 Actions IP 的 JS 校验与页面跳转...")
+        for _ in range(6):
+            content = await page.content()
+            if "Access denied" not in content and "Just a moment" not in content:
+                break
+            await asyncio.sleep(2)
+
+        # 检查是否依然被 Access Denied
+        current_content = await page.content()
+        if "Access denied" in current_content:
+            await page.screenshot(path="access_denied_block.png")
+            raise Exception("Mitelis 防火墙拒绝了 Actions IP 的访问，截图保存为 `access_denied_block.png`。")
 
         # 检查凭证是否失效
-        await asyncio.sleep(3)
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
             raise Exception("Cookie 已失效，面板将其重定向回了登录页，请在浏览器重新导出最新 Cookie！")
 
-        print("✅ Cookie 验证成功，已成功进入后台！")
+        print("✅ 防火墙与账号 Session 校验成功，已成功进入后台！")
 
         print("⏳ 等待面板 API 异步渲染服务器数据...")
         try:
-            # 智能等待服务器卡片或控制台按钮加载出来
             await page.wait_for_selector('a[href*="/server/"], button', timeout=20000)
         except Exception:
             print("⚠️ 页面渲染等待超时，尝试直接分析当前页面 DOM...")
 
-        # 2. 如果还在服务器列表页，寻找卡片点击进入
+        # 2. 如果处于列表页，点击卡片进入控制台
         if "/server/" not in page.url:
             print("🌐 2/3 处于服务器列表页，准备点击进入控制台...")
-            
-            # 使用 Playwright Locator 匹配服务器卡片/链接（支持 Shadow DOM）
             server_card = page.locator('a[href*="/server/"]').first
             if await server_card.count() == 0:
                 server_card = page.locator('text=jack').first
@@ -134,23 +151,20 @@ async def run_automation():
         else:
             print("✅ 当前已直接位于服务器控制台页面。")
 
-        # 3. 定位开机按钮 (弃用 XPath，使用原生 Locator 穿透 Shadow DOM)
+        # 3. 定位并点击【Старт】开机按钮
         print("🔍 3/3 正在定位【Старт / 开始】按钮...")
 
-        # 使用正则忽略大小写匹配 Старт / Start / 开始
         start_btn = page.locator('button').filter(has_text=re.compile(r'Старт|Start|开始', re.IGNORECASE)).first
 
-        # 保底匹配：如果找到带图标的绿色按钮
         if await start_btn.count() == 0:
             start_btn = page.locator('button.bg-green-600, button.btn-success').first
 
-        # 校验按钮是否存在
         btn_count = await start_btn.count()
         if btn_count == 0:
             await page.screenshot(path="button_not_found.png")
             raise Exception("在控制台页面未能找到【Старт / 开始】按钮，截图已保存为 `button_not_found.png`。")
 
-        # 判断当前运行状态
+        # 判断当前状态
         page_text = (await page.locator('body').inner_text()).lower()
         if "включён" in page_text or "running" in page_text or "online" in page_text:
             print("🎉 服务器当前已经是【Включён / 运行中】状态！")
@@ -160,7 +174,6 @@ async def run_automation():
             await start_btn.click(timeout=10000)
             await asyncio.sleep(8)
             
-            # 保存执行后的截图
             await page.screenshot(path="after_click.png")
             print("🎉 开机指令已成功提交！")
             send_tg_message("🖥️ 服务器状态: *开机指令已成功发出 🚀*\n💡 正在后台初始化开机，请稍后在面板查看。")
@@ -168,13 +181,11 @@ async def run_automation():
         await browser.close()
 
 async def main():
-    """主入口：包含全局异常捕获，确保报错时 100% 发送 Telegram 通知"""
     try:
         await run_automation()
     except Exception as e:
         error_msg = str(e)
         print(f"\n❌ 脚本运行出错: {error_msg}")
-        # 全局保底通知
         send_tg_message(f"⚠️ *脚本运行出现错误！*\n\n错误详情:\n`{error_msg}`")
         sys.exit(1)
 
