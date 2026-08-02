@@ -1,4 +1,4 @@
-name: Rustix Auto Restart via VPS SSH Password
+name: Rustix Auto Restart via NODE_LINK
 
 on:
   schedule:
@@ -22,93 +22,41 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install SSH password client
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-client sshpass curl
-
-      - name: Start VPS SSH SOCKS5 tunnel
+      - name: Install and start sing-box
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           set -euo pipefail
-          test -n "$SSH_HOST" || { echo "SSH_HOST 未配置"; exit 1; }
-          test -n "$SSH_USER" || { echo "SSH_USER 未配置"; exit 1; }
-          test -n "$SSH_PASSWORD" || { echo "SSH_PASSWORD 未配置"; exit 1; }
-          SSH_PORT="${SSH_PORT:-22}"
+          test -n "$NODE_LINK" || { echo "NODE_LINK 未配置"; exit 1; }
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null || {
-            echo "无法连接 VPS SSH 端口，请检查 SSH_HOST 和 SSH_PORT"
-            exit 1
-          }
-          chmod 600 ~/.ssh/known_hosts
+          curl -fL --retry 3 -o sing-box.tar.gz \
+            https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box.tar.gz
+          mv sing-box-*/sing-box ./sing-box
+          chmod +x ./sing-box
 
-          # 先验证 VPS 自己能访问公网，排除 VPS DNS/网络故障。
-          SSHPASS="$SSH_PASSWORD" sshpass -e ssh \
-            -p "$SSH_PORT" \
-            -o PreferredAuthentications=password,keyboard-interactive \
-            -o PubkeyAuthentication=no \
-            -o ConnectTimeout=15 \
-            "$SSH_USER@$SSH_HOST" \
-            "command -v curl >/dev/null && curl -fsS --max-time 20 https://api.ipify.org" \
-            > vps_remote_ip.txt 2> ssh_login_test.log || {
-              echo "SSH 能登录，但 VPS 自身联网测试失败"
-              cat ssh_login_test.log || true
-              exit 1
-            }
-          echo "VPS 远程出口 IP：$(cat vps_remote_ip.txt)"
+          python parse_node.py
+          ./sing-box check -c config.json
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          sleep 8
 
-          SSHPASS="$SSH_PASSWORD" sshpass -e ssh \
-            -vv \
-            -E ssh_tunnel.log \
-            -p "$SSH_PORT" \
-            -N -D 127.0.0.1:10808 \
-            -o PreferredAuthentications=password,keyboard-interactive \
-            -o PubkeyAuthentication=no \
-            -o BatchMode=no \
-            -o ExitOnForwardFailure=yes \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=3 \
-            "$SSH_USER@$SSH_HOST" \
-            >/dev/null 2>&1 &
-
-          echo $! > ssh_tunnel.pid
-          sleep 6
-          if ! kill -0 "$(cat ssh_tunnel.pid)" 2>/dev/null; then
-            echo "SSH 密码登录或隧道启动失败"
-            cat ssh_tunnel.log || true
+          if ! kill -0 "$(cat singbox.pid)" 2>/dev/null; then
+            echo "sing-box 启动失败"
+            cat singbox.log || true
             exit 1
           fi
 
-          timeout 3 bash -c '</dev/tcp/127.0.0.1/10808' || {
-            echo "本地 SOCKS5 端口 10808 未监听"
-            cat ssh_tunnel.log || true
-            exit 1
-          }
+          echo "===== sing-box 日志 ====="
+          cat singbox.log || true
 
-          # 必须实际通过 SOCKS5 打开 HTTPS；仅端口监听不代表 VPS 允许转发。
-          if ! curl --socks5-hostname 127.0.0.1:10808 \
-              --connect-timeout 15 --max-time 30 \
-              -fsS https://api.ipify.org -o ssh_proxy_ip.txt; then
-            echo "SSH 已登录，但 VPS SSH 服务拒绝或中断 TCP 转发。"
-            echo "请在 VPS /etc/ssh/sshd_config 设置 AllowTcpForwarding yes。"
-            echo "===== SSH 详细日志 ====="
-            cat ssh_tunnel.log || true
-            exit 1
-          fi
-          echo "SSH SOCKS5 隧道可用，代理出口 IP：$(cat ssh_proxy_ip.txt)"
-
-      - name: Verify VPS exit and Rustix access
+      - name: Verify NODE_LINK proxy
         run: |
           set -euo pipefail
-          echo "===== VPS 出口 IP ====="
-          cp ssh_proxy_ip.txt vps_exit_ip.txt
-          cat vps_exit_ip.txt
+          echo "===== 节点出口 IP ====="
+          curl --socks5-hostname 127.0.0.1:10808 \
+            --connect-timeout 15 --max-time 30 \
+            -fsS https://api.ipify.org | tee node_exit_ip.txt
           echo
 
           echo "===== Rustix HTTPS 预检 ====="
@@ -116,8 +64,8 @@ jobs:
             --connect-timeout 20 --max-time 40 \
             -sS -D rustix_headers.txt -o rustix_probe.html \
             https://my.rustix.me/ || {
-              echo "通过 VPS 访问 Rustix 失败"
-              cat ssh_tunnel.log || true
+              echo "NODE_LINK 无法访问 Rustix"
+              cat singbox.log || true
               exit 1
             }
           head -n 20 rustix_headers.txt || true
@@ -127,7 +75,7 @@ jobs:
           pip install playwright requests
           playwright install --with-deps chromium
 
-      - name: Run Rustix automation through VPS
+      - name: Run Rustix automation
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -139,13 +87,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rustix-vps-password-${{ github.run_number }}
+          name: rustix-node-link-${{ github.run_number }}
           if-no-files-found: ignore
           path: |
             *.png
             *.html
             *.txt
-            ssh_tunnel.log
+            singbox.log
+            config.json
 
       - name: Delete old workflow runs
         if: always()
