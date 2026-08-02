@@ -1,217 +1,258 @@
 import asyncio
-import requests
-import os
 import json
-import sys
+import os
 import re
 import socket
+import sys
 from urllib.parse import urlparse
+
+import requests
 from playwright.async_api import async_playwright
 
-TG_TOKEN = os.environ.get("TG_TOKEN")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
-COOKIES_JSON = os.environ.get("COOKIES_JSON")
-PROXY_URL = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+COOKIES_JSON = os.getenv("COOKIES_JSON", "")
+PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
+CONSOLE_URL = os.getenv("CONSOLE_URL", "https://my.rustix.me/server/226fd977/console")
 
-CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
-EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
+NETWORK_MARKERS = (
+    "ERR_SSL_PROTOCOL_ERROR", "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED", "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_TIMED_OUT",
+    "ERR_NAME_NOT_RESOLVED", "chrome-error://chromewebdata",
+)
+BUTTONS = (
+    ("restart", ("Рестарт", "Restart", "Reboot", "重启")),
+    ("start", ("Старт", "Start", "启动", "开机")),
+)
 
-def send_tg_message(text):
+
+def notify(text):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("💡 [TG] TG_TOKEN 或 TG_CHAT_ID 未配置，跳过 Telegram 通知。")
+        print("[TG] 未配置，跳过通知")
         return
-        
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID, 
-        "text": f"✅ rustix.me 服务器自动启动/保活通知\n\n{text}"
-    }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"❌ [TG] 发送 Telegram 消息失败: Status {res.status_code}, Response: {res.text}")
-        else:
-            print("✅ [TG] Telegram 通知已成功发送！")
-    except Exception as e:
-        print(f"❌ [TG] 发送 Telegram 消息异常: {e}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": f"Rustix 自动启动/保活通知\n\n{text}"},
+            timeout=15,
+        )
+        print("[TG] 通知发送成功" if r.ok else f"[TG] 通知失败: HTTP {r.status_code}")
+    except Exception as exc:
+        print(f"[TG] 通知异常: {exc}")
 
-def check_proxy_port(proxy_url):
+
+def proxy_port_ok(url):
+    parsed = urlparse(url)
     try:
-        parsed = urlparse(proxy_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 10809
-        with socket.create_connection((host, port), timeout=2):
+        with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 10808), timeout=3):
             return True
-    except Exception:
+    except OSError:
         return False
 
-def format_cookies_for_playwright(raw_cookies):
-    cleaned_cookies = []
-    for c in raw_cookies:
-        cookie = {
-            "name": c.get("name", ""),
-            "value": c.get("value"),
-            "domain": c.get("domain"),
+
+def normalize_cookies(value):
+    raw = json.loads(value)
+    if isinstance(raw, dict):
+        raw = raw.get("cookies", [])
+    if not isinstance(raw, list):
+        raise ValueError("Cookie JSON 顶层必须是数组，或包含 cookies 数组")
+    result = []
+    for c in raw:
+        if not c.get("name") or c.get("value") is None:
+            continue
+        item = {
+            "name": c["name"], "value": str(c["value"]),
             "path": c.get("path", "/"),
-            "secure": c.get("secure", True),
-            "httpOnly": c.get("httpOnly", False)
+            "secure": bool(c.get("secure", True)),
+            "httpOnly": bool(c.get("httpOnly", False)),
         }
-        same_site = str(c.get("sameSite", "")).lower()
-        if same_site in ["no_restriction", "none"]:
-            cookie["sameSite"] = "None"
-        elif same_site == "lax":
-            cookie["sameSite"] = "Lax"
-        elif same_site == "strict":
-            cookie["sameSite"] = "Strict"
-            
-        if "expirationDate" in c:
-            cookie["expires"] = int(c["expirationDate"])
-            
-        cleaned_cookies.append(cookie)
-    return cleaned_cookies
+        if c.get("domain"):
+            item["domain"] = c["domain"]
+        else:
+            item["url"] = "https://my.rustix.me"
+        same = str(c.get("sameSite", "")).lower()
+        if same in ("none", "no_restriction"):
+            item["sameSite"] = "None"
+        elif same == "lax":
+            item["sameSite"] = "Lax"
+        elif same == "strict":
+            item["sameSite"] = "Strict"
+        expires = c.get("expirationDate", c.get("expires"))
+        if expires:
+            try:
+                item["expires"] = int(float(expires))
+            except (TypeError, ValueError):
+                pass
+        result.append(item)
+    if not result:
+        raise ValueError("没有可用 Cookie")
+    return result
 
-async def run_automation():
-    if not COOKIES_JSON:
-        raise Exception("未配置 COOKIES_JSON 环境变量，请检查 GitHub Secrets 配置！")
 
+async def save_diagnostics(page, prefix):
+    await page.screenshot(path=f"{prefix}.png", full_page=True)
     try:
-        raw_cookies = json.loads(COOKIES_JSON)
-        formatted_cookies = format_cookies_for_playwright(raw_cookies)
-    except Exception as e:
-        raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(await page.content())
+        with open(f"{prefix}_text.txt", "w", encoding="utf-8") as f:
+            f.write(await page.locator("body").inner_text(timeout=5000))
+        frame_lines = [f"{i}: name={fr.name!r} url={fr.url}" for i, fr in enumerate(page.frames)]
+        with open(f"{prefix}_frames.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(frame_lines))
+    except Exception as exc:
+        print(f"保存部分诊断文件失败: {exc}")
 
-    print("\n==========================================")
-    print("🚀 开始访问 Rustix 服务器控制台页面")
+
+async def click_in_frame(frame):
+    # First use accessible locators. This covers native buttons and most UI libraries.
+    for action, labels in BUTTONS:
+        for label in labels:
+            pattern = re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
+            locators = [
+                frame.get_by_role("button", name=pattern),
+                frame.locator('button, [role="button"], a, [tabindex]').filter(has_text=pattern),
+                frame.get_by_text(pattern, exact=True),
+            ]
+            for locator in locators:
+                try:
+                    count = min(await locator.count(), 20)
+                    for i in range(count):
+                        el = locator.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        if await el.get_attribute("disabled") is not None:
+                            continue
+                        if (await el.get_attribute("aria-disabled")) == "true":
+                            continue
+                        classes = (await el.get_attribute("class")) or ""
+                        if "disabled" in classes.lower():
+                            continue
+                        await el.scroll_into_view_if_needed()
+                        await el.click(force=True, timeout=5000)
+                        return action, label, frame.url
+                except Exception:
+                    pass
+
+    # Deep fallback traverses open shadow roots and clicks the smallest exact-text node.
+    try:
+        result = await frame.evaluate("""
+        (groups) => {
+          const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const collect = root => {
+            const out = [];
+            const walk = node => {
+              if (!node) return;
+              if (node.nodeType === 1) {
+                out.push(node);
+                if (node.shadowRoot) walk(node.shadowRoot);
+              }
+              for (const child of (node.children || [])) walk(child);
+            };
+            walk(root);
+            return out;
+          };
+          const all = collect(document.documentElement);
+          for (const group of groups) {
+            for (const label of group.labels) {
+              const wanted = norm(label);
+              const matches = all.filter(el => norm(el.innerText || el.textContent) === wanted);
+              matches.sort((a,b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+              for (const el of matches) {
+                const target = el.closest('button,[role="button"],a,[tabindex]') || el;
+                const st = getComputedStyle(target);
+                const rect = target.getBoundingClientRect();
+                if (st.display === 'none' || st.visibility === 'hidden' || rect.width < 2 || rect.height < 2) continue;
+                if (target.disabled || target.getAttribute('aria-disabled') === 'true') continue;
+                target.scrollIntoView({block:'center'});
+                target.click();
+                return {action: group.action, label};
+              }
+            }
+          }
+          return null;
+        }
+        """, [{"action": a, "labels": list(labels)} for a, labels in BUTTONS])
+        if result:
+            return result["action"], result["label"], frame.url
+    except Exception:
+        pass
+    return None
+
+
+async def find_and_click(page):
+    # Frontend/WebSocket rendering can be slow. Search main document and every iframe for 60 seconds.
+    for attempt in range(20):
+        for frame in page.frames:
+            result = await click_in_frame(frame)
+            if result:
+                return result
+        print(f"等待控制按钮渲染: {attempt + 1}/20")
+        await page.wait_for_timeout(3000)
+    return None
+
+
+async def run():
+    if not COOKIES_JSON:
+        raise RuntimeError("未配置 COOKIES_JSON")
+    if not proxy_port_ok(PROXY_URL):
+        raise RuntimeError(f"代理端口未监听: {PROXY_URL}")
+    cookies = normalize_cookies(COOKIES_JSON)
+
+    print("==========================================")
+    print("开始访问 Rustix 控制台")
+    print(f"代理: {PROXY_URL}")
     print("==========================================")
 
     async with async_playwright() as p:
-        launch_options = {
-            "headless": False,
-            "ignore_default_args": ["--enable-automation"],
-            "args": [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-quic",
-                "--window-size=1366,768"
-            ]
-        }
-
-        if PROXY_URL and check_proxy_port(PROXY_URL):
-            print(f"🌐 节点代理正常运行，正在通过 HTTP 隧道代理访问: {PROXY_URL}")
-            launch_options["proxy"] = {"server": PROXY_URL}
-        else:
-            raise Exception("本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
-
-        browser = await p.chromium.launch(**launch_options)
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=EXACT_USER_AGENT,
-            locale="ru-RU"
+        browser = await p.chromium.launch(
+            headless=True,
+            proxy={"server": PROXY_URL},
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-quic"],
         )
-
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
-
-        print("🔑 正在注入账号 Session Cookie...")
-        await context.add_cookies(formatted_cookies)
-
+        context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="ru-RU")
+        await context.add_cookies(cookies)
         page = await context.new_page()
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                print(f"🌐 访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
-                await page.goto(CONSOLE_URL, wait_until="commit", timeout=25000)
-                break
-            except Exception as e:
-                print(f"⚠️ 页面响应延迟 ({e})，等待 5 秒重试...")
-                if attempt == max_retries - 1:
-                    raise Exception(f"通过代理连接控制台失败: {e}")
-                await asyncio.sleep(5)
+        response = await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(8000)
+        body = await page.locator("body").inner_text(timeout=10000)
+        combined = f"{page.url}\n{body}"
+        for marker in NETWORK_MARKERS:
+            if marker.lower() in combined.lower():
+                await save_diagnostics(page, "network_error")
+                raise RuntimeError(f"页面网络错误: {marker}")
+        if response and response.status >= 400:
+            await save_diagnostics(page, "http_error")
+            raise RuntimeError(f"Rustix 返回 HTTP {response.status}")
+        if "access denied" in body.lower():
+            await save_diagnostics(page, "access_denied")
+            raise RuntimeError("Rustix/Mitelis 返回 Access denied")
+        if "login" in page.url.lower() or "auth" in page.url.lower():
+            await save_diagnostics(page, "login_failed")
+            raise RuntimeError("Cookie 已失效，已跳转登录页")
 
-        print("⏳ 等待页面 DOM 加载与 Cloudflare/Mitelis 校验 (8秒)...")
-        await asyncio.sleep(8)
+        result = await find_and_click(page)
+        if not result:
+            await save_diagnostics(page, "button_not_found")
+            raise RuntimeError("控制台已打开，但 60 秒内在主页面、iframe 和 Shadow DOM 中均未找到可用的 Рестарт/Старт 按钮")
 
-        try:
-            current_content = await page.content()
-        except Exception:
-            current_content = ""
-
-        if "Access denied" in current_content:
-            await page.screenshot(path="access_denied_block.png")
-            raise Exception("提示 Access denied，请确认节点 IP 或更新最新 Cookie！")
-
-        if "login" in page.url or "auth" in page.url:
-            await page.screenshot(path="login_failed.png")
-            raise Exception("Cookie 已失效，面板将其重定向回了登录页，请重新导出最新 Cookie！")
-
-        print("✅ 防火墙与 Session 校验成功，已进入控制台！")
-
-        print("⏳ 正在等待前端 WebSocket 与控制按钮完全加载渲染 (8秒)...")
-        await asyncio.sleep(8)
-
-        # 💡 终极定位方案：直接在浏览器内部注入 JS 遍历页面元素，精准识别并点击【Старт】或【Рестарт】
-        click_result = await page.evaluate("""
-            () => {
-                const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
-                
-                // 寻找开机按钮 (Старт / Start)
-                for (const el of candidates) {
-                    const txt = (el.innerText || el.textContent || '').trim();
-                    if (/^(Старт|Start)$/i.test(txt) || txt.includes('Старт')) {
-                        // 找最近的可点击父节点或自身
-                        const clickable = el.closest('button, a, div[role="button"]') || el;
-                        clickable.click();
-                        return { success: true, action: 'Старт (开机)', text: txt };
-                    }
-                }
-                
-                // 寻找重启按钮 (Рестарт / Restart)
-                for (const el of candidates) {
-                    const txt = (el.innerText || el.textContent || '').trim();
-                    if (/^(Рестарт|Restart)$/i.test(txt) || txt.includes('Рестарт')) {
-                        const clickable = el.closest('button, a, div[role="button"]') || el;
-                        clickable.click();
-                        return { success: true, action: 'Рестарт (重启)', text: txt };
-                    }
-                }
-                
-                return { success: false };
-            }
-        """)
-
-        if click_result and click_result.get("success"):
-            action_name = click_result.get("action")
-            print(f"🎉 JS 精准匹配并成功点击了按钮:【{action_name}】！")
-            await asyncio.sleep(6)
-            await page.screenshot(path="after_click.png")
-            send_tg_message(f"🖥️ 服务器保活指令已发出: {action_name} 🚀\n💡 已成功触发控制台按钮。")
-        else:
-            # 兜底：如果 JS 全文查找未果，强行点击页面顶栏右侧的第一个按钮容器
-            print("⚠️ 未匹配到指定俄文文本，尝试针对控制台顶部按钮区域进行点击...")
-            top_buttons = page.locator('div[class*="flex"] > button, div[class*="flex"] > div[class*="cursor-pointer"]')
-            if await top_buttons.count() > 0:
-                await top_buttons.first.click(force=True)
-                await asyncio.sleep(6)
-                await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器保活指令已发出 🚀\n💡 已成功点击顶部控制按钮。")
-            else:
-                await page.screenshot(path="button_not_found.png")
-                raise Exception("未能在控制台页面匹配到可操作按钮，截图已保存为 button_not_found.png。")
-
+        action, label, frame_url = result
+        print(f"成功点击: {label}；frame={frame_url}")
+        await page.wait_for_timeout(8000)
+        await page.screenshot(path="after_click.png", full_page=True)
+        notify(f"服务器控制指令已发出：{label}（{action}）")
         await browser.close()
+
 
 async def main():
     try:
-        await run_automation()
-    except Exception as e:
-        error_msg = str(e)
-        print(f"\n❌ 脚本运行出错: {error_msg}")
-        send_tg_message(f"⚠️ 脚本运行出现错误！\n\n错误详情:\n{error_msg}")
+        await run()
+    except Exception as exc:
+        print(f"脚本运行出错: {exc}")
+        notify(f"脚本运行失败\n\n{exc}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
