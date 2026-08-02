@@ -48,7 +48,24 @@ jobs:
           }
           chmod 600 ~/.ssh/known_hosts
 
+          # 先验证 VPS 自己能访问公网，排除 VPS DNS/网络故障。
           SSHPASS="$SSH_PASSWORD" sshpass -e ssh \
+            -p "$SSH_PORT" \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no \
+            -o ConnectTimeout=15 \
+            "$SSH_USER@$SSH_HOST" \
+            "command -v curl >/dev/null && curl -fsS --max-time 20 https://api.ipify.org" \
+            > vps_remote_ip.txt 2> ssh_login_test.log || {
+              echo "SSH 能登录，但 VPS 自身联网测试失败"
+              cat ssh_login_test.log || true
+              exit 1
+            }
+          echo "VPS 远程出口 IP：$(cat vps_remote_ip.txt)"
+
+          SSHPASS="$SSH_PASSWORD" sshpass -e ssh \
+            -vv \
+            -E ssh_tunnel.log \
             -p "$SSH_PORT" \
             -N -D 127.0.0.1:10808 \
             -o PreferredAuthentications=password,keyboard-interactive \
@@ -58,7 +75,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=3 \
             "$SSH_USER@$SSH_HOST" \
-            > ssh_tunnel.log 2>&1 &
+            >/dev/null 2>&1 &
 
           echo $! > ssh_tunnel.pid
           sleep 6
@@ -73,15 +90,25 @@ jobs:
             cat ssh_tunnel.log || true
             exit 1
           }
-          echo "SSH 密码登录成功，SOCKS5 隧道已启动：127.0.0.1:10808"
+
+          # 必须实际通过 SOCKS5 打开 HTTPS；仅端口监听不代表 VPS 允许转发。
+          if ! curl --socks5-hostname 127.0.0.1:10808 \
+              --connect-timeout 15 --max-time 30 \
+              -fsS https://api.ipify.org -o ssh_proxy_ip.txt; then
+            echo "SSH 已登录，但 VPS SSH 服务拒绝或中断 TCP 转发。"
+            echo "请在 VPS /etc/ssh/sshd_config 设置 AllowTcpForwarding yes。"
+            echo "===== SSH 详细日志 ====="
+            cat ssh_tunnel.log || true
+            exit 1
+          fi
+          echo "SSH SOCKS5 隧道可用，代理出口 IP：$(cat ssh_proxy_ip.txt)"
 
       - name: Verify VPS exit and Rustix access
         run: |
           set -euo pipefail
           echo "===== VPS 出口 IP ====="
-          curl --socks5-hostname 127.0.0.1:10808 \
-            --connect-timeout 15 --max-time 30 \
-            -fsS https://api.ipify.org | tee vps_exit_ip.txt
+          cp ssh_proxy_ip.txt vps_exit_ip.txt
+          cat vps_exit_ip.txt
           echo
 
           echo "===== Rustix HTTPS 预检 ====="
