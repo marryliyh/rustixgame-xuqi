@@ -12,7 +12,7 @@ from playwright.async_api import async_playwright
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
-PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:10809")
+PROXY_URL = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 CONSOLE_URL = os.environ.get("CONSOLE_URL", "https://my.rustix.me/server/226fd977/console")
 
 # Chromium internal error pages. Seeing one of these means the web panel was never loaded.
