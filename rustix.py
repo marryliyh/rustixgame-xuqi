@@ -6,16 +6,16 @@ import sys
 import re
 from playwright.async_api import async_playwright
 
-# --- 从环境变量读取敏感信息 ---
+# --- 从环境变量读取配置 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
+PROXY_URL = os.environ.get("PROXY_URL")  # 可选：代理地址，如 http://127.0.0.1:7890 或 socks5://...
 
 BASE_URL = "https://my.rustix.me/"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
 def send_tg_message(text):
-    """发送带 Markdown 格式的 Telegram 消息"""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("💡 [TG] TG_TOKEN 或 TG_CHAT_ID 未配置，跳过 Telegram 通知。")
         return
@@ -33,7 +33,7 @@ def format_cookies_for_playwright(raw_cookies):
     for c in raw_cookies:
         name = c.get("name", "")
         
-        # 💡 核心修复：剔除绑定了本机 IP 的 Mitelis WAF 校验 Cookie
+        # 剔除绑定了本机 IP 的 Mitelis WAF 校验 Cookie
         if name.startswith("mit_ck"):
             print(f"🧹 自动过滤与旧 IP 绑定的 WAF Cookie: {name}")
             continue
@@ -71,21 +71,28 @@ async def run_automation():
         raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
 
     print("\n==========================================")
-    print("🚀 开始通过 Cookie 免登录启动服务器")
+    print("🚀 开始通过 GitHub Actions 默认 IP 启动任务")
     print("==========================================")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-            args=[
+        launch_options = {
+            "headless": False,
+            "ignore_default_args": ["--enable-automation"],
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1366,768"
             ]
-        )
+        }
+
+        # 如果配置了自定义代理节点则接入
+        if PROXY_URL:
+            print(f"🌐 正在通过代理访问: {PROXY_URL}")
+            launch_options["proxy"] = {"server": PROXY_URL}
+
+        browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             user_agent=EXACT_USER_AGENT,
@@ -105,38 +112,37 @@ async def run_automation():
         try:
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"⚠️ 页面加载较慢: {e}")
+            print(f"⚠️ 页面加载超时: {e}")
 
-        # ⏳ 给 Mitelis 防火墙 5-8 秒时间在 Actions 的新 IP 上完成 JS 挑战和自动重定向
-        print("⏳ 等待 Mitelis WAF 完成 Actions IP 的 JS 校验与页面跳转...")
-        for _ in range(6):
+        # ⏳ 等待页面自动跳转/解密
+        print("⏳ 等待页面加载与 WAF 自动响应...")
+        for _ in range(8):
             content = await page.content()
             if "Access denied" not in content and "Just a moment" not in content:
                 break
             await asyncio.sleep(2)
 
-        # 检查是否依然被 Access Denied
+        # 检查是否依旧拦截
         current_content = await page.content()
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("Mitelis 防火墙拒绝了 Actions IP 的访问，截图保存为 `access_denied_block.png`。")
+            raise Exception("GitHub Actions 默认 IP 也被 Mitelis 防火墙拦截！建议配置 Secret `PROXY_URL` 传入自定义代理。")
 
-        # 检查凭证是否失效
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
-            raise Exception("Cookie 已失效，面板将其重定向回了登录页，请在浏览器重新导出最新 Cookie！")
+            raise Exception("Cookie 已失效，面板将其重定向回了登录页，请重新导出最新 Cookie！")
 
-        print("✅ 防火墙与账号 Session 校验成功，已成功进入后台！")
+        print("✅ 防火墙与账号 Session 校验成功，已进入后台！")
 
-        print("⏳ 等待面板 API 异步渲染服务器数据...")
+        print("⏳ 等待面板 API 异步渲染数据...")
         try:
             await page.wait_for_selector('a[href*="/server/"], button', timeout=20000)
         except Exception:
-            print("⚠️ 页面渲染等待超时，尝试直接分析当前页面 DOM...")
+            print("⚠️ 页面渲染等待超时，直接分析 DOM...")
 
-        # 2. 如果处于列表页，点击卡片进入控制台
+        # 2. 如果处于列表页，进入控制台
         if "/server/" not in page.url:
-            print("🌐 2/3 处于服务器列表页，准备点击进入控制台...")
+            print("🌐 2/3 处于服务器列表页，点击进入控制台...")
             server_card = page.locator('a[href*="/server/"]').first
             if await server_card.count() == 0:
                 server_card = page.locator('text=jack').first
@@ -147,7 +153,7 @@ async def run_automation():
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
             else:
-                print("ℹ️ 未能找到服务器卡片，尝试直接在当前页面寻找控制按键...")
+                print("ℹ️ 未找到服务器卡片，尝试直接寻找按钮...")
         else:
             print("✅ 当前已直接位于服务器控制台页面。")
 
