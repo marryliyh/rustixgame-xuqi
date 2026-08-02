@@ -5,7 +5,6 @@ import json
 import sys
 from playwright.async_api import async_playwright
 
-# --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 ACCOUNTS_JSON = os.environ.get("ACCOUNTS_JSON")
@@ -13,7 +12,6 @@ ACCOUNTS_JSON = os.environ.get("ACCOUNTS_JSON")
 LOGIN_URL = "https://my.rustix.me/auth/login"
 
 def send_tg_message(text):
-    """发送带 Markdown 格式的 Telegram 消息"""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("💡 [TG] TG_TOKEN 或 TG_CHAT_ID 未配置，跳过 Telegram 通知。")
         return
@@ -26,8 +24,28 @@ def send_tg_message(text):
     except Exception as e:
         print(f"❌ [TG] 发送 Telegram 消息失败: {e}")
 
+async def auto_click_cloudflare(page):
+    """尝试自动定位并点击 Cloudflare Turnstile 复选框"""
+    print("🔍 正在检查是否存在 Cloudflare 人机验证框...")
+    for _ in range(5):
+        try:
+            # 尝试查找 Cloudflare iframe
+            frames = page.frames
+            for frame in frames:
+                if "cloudflare.com" in frame.url or "challenges" in frame.url:
+                    print("⚡ 发现 Cloudflare 验证 Frame，尝试寻找点击目标...")
+                    checkbox = frame.locator('input[type="checkbox"], .cb-i, #challenge-stage')
+                    if await checkbox.count() > 0:
+                        await checkbox.first.click()
+                        print("✅ 已成功尝试点击 Cloudflare 复选框！")
+                        await asyncio.sleep(4)
+                        return True
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    return False
+
 async def process_account(account):
-    """处理单个账户的逻辑"""
     user_email = account.get("user")
     user_pwd = account.get("pwd")
     
@@ -36,7 +54,6 @@ async def process_account(account):
     print(f"==========================================")
 
     async with async_playwright() as p:
-        # 核心改动：ignore_default_args 去掉 chromium 自带的 --enable-automation
         browser = await p.chromium.launch(
             headless=False,
             ignore_default_args=["--enable-automation"],
@@ -54,7 +71,6 @@ async def process_account(account):
             locale="ru-RU"
         )
 
-        # 原生注入全套 Anti-Detection 指纹伪装
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -64,50 +80,46 @@ async def process_account(account):
 
         page = await context.new_page()
 
-        # 1. 打开登录页面
         print(f"🌐 1/4 打开登录页面: {LOGIN_URL}")
         try:
-            await page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
-        except Exception:
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"⚠️ 页面加载超时或异常，尝试继续: {e}")
+
+        # 尝试自动点击 CF 验证框
+        await auto_click_cloudflare(page)
 
         print("⏳ 等待页面与 Cloudflare 验证加载完成...")
         
-        # 显式等待登录输入框出现（最多等待 35 秒）
-        try:
-            await page.wait_for_selector(
-                'input[type="text"], input[type="email"], input[name="username"], input[name="email"], input[type="password"]',
-                timeout=35000
-            )
-            print("✅ 已成功找到登录组件，突破 Cloudflare 盾！")
-        except Exception:
+        # 轮询等待登录框（最长 45 秒）
+        login_input_found = False
+        for i in range(9):
+            email_input = await page.query_selector('input[type="text"], input[type="email"], input[name="username"], input[name="email"]')
+            pwd_input = await page.query_selector('input[type="password"]')
+            if email_input and pwd_input:
+                login_input_found = True
+                print("✅ 已成功定位到登录输入框！")
+                break
+            
+            # 再次尝试点击 CF 验证
+            await auto_click_cloudflare(page)
+            await asyncio.sleep(5)
+
+        if not login_input_found:
             print("❌ 未能成功找到登录框，正在保存页面截图 cloudflare_block.png ...")
             await page.screenshot(path="cloudflare_block.png")
             raise Exception("登录输入框寻找超时，可能依然卡在 Cloudflare 人机验证页面。")
 
-        # 智能搜寻输入框
         email_input = await page.query_selector('input[type="text"], input[type="email"], input[name="username"], input[name="email"], form input:nth-of-type(1)')
         pwd_input = await page.query_selector('input[type="password"]')
 
-        if not email_input or not pwd_input:
-            inputs = await page.query_selector_all('input')
-            if len(inputs) >= 2:
-                email_input = inputs[0]
-                pwd_input = inputs[1]
-
-        if not email_input or not pwd_input:
-            await page.screenshot(path="cloudflare_block.png")
-            raise Exception("登录输入框寻找超时或未匹配到输入组件。")
-
         print("🔑 正在输入账号密码登录...")
-        # 模拟真实打字输入
         await email_input.fill("")
         await email_input.type(user_email, delay=50)
         await pwd_input.fill("")
         await pwd_input.type(user_pwd, delay=50)
         await asyncio.sleep(1)
 
-        # 点击登录按钮
         login_btn = await page.query_selector('button[type="submit"], button:has-text("Войти"), button:has-text("Login"), button:has-text("Вход"), form button')
         if login_btn:
             await login_btn.click()
@@ -117,7 +129,6 @@ async def process_account(account):
         print("⏳ 登录完成，等待跳转面板...")
         await asyncio.sleep(6)
 
-        # 2. 寻找管理服务器入口
         print("🌐 2/4 正在访问服务器列表并准备进入管理控制台...")
         manage_btn = await page.query_selector('text=Управлять сервером, text=管理服务器, a[href*="/server/"]')
         if manage_btn:
@@ -127,7 +138,6 @@ async def process_account(account):
         else:
             print("ℹ️ 未能匹配到 [Управлять сервером] 按钮，尝试直接检测控制台组件...")
 
-        # 3. 检测控制台及运行状态
         print("🔍 3/4 正在检查服务器控制台状态...")
         try:
             await page.wait_for_selector('text=Консоль, text=Console, text=Старт, text=Рестарт', timeout=30000)
@@ -138,7 +148,6 @@ async def process_account(account):
         await asyncio.sleep(2)
         page_text = (await page.locator('body').inner_text()).lower()
 
-        # 根据俄语面板状态判断：Включён (运行中) / Отключён (已关机/已禁用)
         if "включён" in page_text or "online" in page_text or "running" in page_text:
             print("🎉 服务器当前状态：【Включён / 运行中】")
             send_tg_message(f"👤 账户: `{user_email}`\n🖥️ 服务器状态: *Включён (运行中)*\n💡 操作结果: 无需重复启动。")
@@ -159,7 +168,6 @@ async def process_account(account):
                 except Exception as e:
                     print(f"⚠️ 保底点击未成功: {e}")
 
-            # 处理二次弹窗确认
             await asyncio.sleep(2)
             confirm_btn = await page.query_selector("//button[contains(text(), '确认') or contains(text(), 'Yes') or contains(text(), 'Да')]")
             if confirm_btn:
