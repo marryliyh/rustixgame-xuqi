@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 原生 Shell 安装并启动 Cloudflare WARP 伪装 IP
+      # 使用 Cloudflare WARP 伪装 IP 绕过机房 IP 拦截
       - name: Setup Cloudflare WARP
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -47,7 +47,7 @@ jobs:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
         run: python rustix.py
 
-      # 自动删除旧的工作流运行记录，仅保留最近 1 条
+      # 自动清理历史 Action 记录，只留最后 1 条
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
