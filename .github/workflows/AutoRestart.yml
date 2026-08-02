@@ -22,19 +22,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 使用 Cloudflare WARP 伪装 IP
-      - name: Setup Cloudflare WARP
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
-          warp-cli --accept-tos connect || true
-          sleep 5
-          echo "🌐 WARP 状态检查："
-          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip|warp" || true
-
       # 安装 Xvfb (虚拟显示) 
       - name: Install dependencies & Xvfb
         run: |
@@ -48,6 +35,8 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
+          # 💡 如果 GitHub 默认 IP 也被拦，可以取消下一行的注释并在 Secret 配置你自己的 SOCKS5/HTTP 代理
+          # PROXY_URL: ${{ secrets.PROXY_URL }}
         run: xvfb-run --auto-servernum python rustix.py
 
       # 上传截图供排查
