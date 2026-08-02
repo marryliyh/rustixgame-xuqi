@@ -1,4 +1,4 @@
-name: Rustix Auto Restart via NODE_LINK
+name: Rustix Auto Restart
 
 on:
   schedule:
