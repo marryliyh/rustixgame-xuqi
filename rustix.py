@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
-PROXY_URL = os.environ.get("PROXY_URL")
+PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:10809")
 
 CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
@@ -39,7 +39,7 @@ def check_proxy_port(proxy_url):
     try:
         parsed = urlparse(proxy_url)
         host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 10808
+        port = parsed.port or 10809
         with socket.create_connection((host, port), timeout=2):
             return True
     except Exception:
@@ -48,10 +48,8 @@ def check_proxy_port(proxy_url):
 def format_cookies_for_playwright(raw_cookies):
     cleaned_cookies = []
     for c in raw_cookies:
-        name = c.get("name", "")
-        # 💡 保留所有包含 mit_ck 在内的核心 Session 与 WAF Cookie
         cookie = {
-            "name": name,
+            "name": c.get("name", ""),
             "value": c.get("value"),
             "domain": c.get("domain"),
             "path": c.get("path", "/"),
@@ -95,17 +93,16 @@ async def run_automation():
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
-                "--disable-quic",  # 💡 禁用 QUIC，强制走稳定的 TCP 代理
-                "--ignore-certificate-errors",
+                "--disable-quic",
                 "--window-size=1366,768"
             ]
         }
 
         if PROXY_URL and check_proxy_port(PROXY_URL):
-            print(f"🌐 节点代理正常运行，正在通过代理访问: {PROXY_URL}")
+            print(f"🌐 节点代理正常运行，正在通过 HTTP 隧道代理访问: {PROXY_URL}")
             launch_options["proxy"] = {"server": PROXY_URL}
         else:
-            raise Exception("本地 sing-box 节点代理未正常启动 (127.0.0.1:10808 端口未连通)！")
+            raise Exception(f"本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
 
         browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
@@ -118,7 +115,7 @@ async def run_automation():
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
 
-        print("🔑 正在注入账号 Session 及 WAF Pass Cookie...")
+        print("🔑 正在注入账号 Session Cookie...")
         await context.add_cookies(formatted_cookies)
 
         page = await context.new_page()
@@ -127,8 +124,7 @@ async def run_automation():
         for attempt in range(max_retries):
             try:
                 print(f"🌐 访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
-                # 💡 使用 commit 策略，避免因异步加载资源导致的 ERR_CONNECTION_CLOSED 打断流程
-                await page.goto(CONSOLE_URL, wait_until="commit", timeout=45000)
+                await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=45000)
                 break
             except Exception as e:
                 print(f"⚠️ 页面加载延迟 ({e})，等待 5 秒重试...")
@@ -153,7 +149,7 @@ async def run_automation():
 
         if "Access denied" in current_content:
             await page.screenshot(path="access_denied_block.png")
-            raise Exception("提示 Access denied，请检查 Cookie 是否包含最新有效的防盾 Token！")
+            raise Exception("提示 Access denied，请确认节点 IP 或更新最新 Cookie！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
