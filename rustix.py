@@ -5,15 +5,19 @@ import json
 import sys
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from playwright.async_api import async_playwright
 
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 COOKIES_JSON = os.environ.get("COOKIES_JSON")
-PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:10809")
+
+# 代理地址定义
+HTTP_PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:10809")
+SOCKS5_PROXY_URL = "socks5://127.0.0.1:10808"
 
 CONSOLE_URL = "https://my.rustix.me/server/226fd977/console"
+API_POWER_URL = "https://my.rustix.me/api/client/servers/226fd977/power"
 EXACT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
 
 def send_tg_message(text):
@@ -35,15 +39,60 @@ def send_tg_message(text):
     except Exception as e:
         print(f"❌ [TG] 发送 Telegram 消息异常: {e}")
 
-def check_proxy_port(proxy_url):
+def check_port(host, port):
     try:
-        parsed = urlparse(proxy_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 10809
         with socket.create_connection((host, port), timeout=2):
             return True
     except Exception:
         return False
+
+def format_cookies_for_requests(raw_cookies):
+    cookie_dict = {}
+    xsrf_token = None
+    for c in raw_cookies:
+        name = c.get("name")
+        val = c.get("value")
+        if name and val:
+            cookie_dict[name] = val
+            if name == "XSRF-TOKEN":
+                xsrf_token = unquote(val)
+    return cookie_dict, xsrf_token
+
+def try_api_power_trigger(raw_cookies):
+    """【方案一】：直接通过 Pterodactyl API 发送开机/重启请求，绕过浏览器与前端渲染"""
+    print("\n⚡ [方案一] 尝试通过面板 API 直连发送保活指令...")
+    cookie_dict, xsrf_token = format_cookies_for_requests(raw_cookies)
+    
+    proxies = {
+        "http": HTTP_PROXY_URL,
+        "https": HTTP_PROXY_URL
+    }
+    
+    headers = {
+        "User-Agent": EXACT_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": CONSOLE_URL,
+        "Origin": "https://my.rustix.me"
+    }
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
+
+    # 先试 restart，若失败试 start
+    for action in ["restart", "start"]:
+        try:
+            res = requests.post(API_POWER_URL, json={"signal": action}, headers=headers, cookies=cookie_dict, proxies=proxies, timeout=15)
+            if res.status_code in [200, 204]:
+                print(f"🎉 API 响应成功 (Status {res.status_code})！已成功发出【{action}】指令！")
+                send_tg_message(f"🖥️ 面板 API 直连成功 🚀\n💡 已通过后端 API 发送服务器 [{action}] 指令，秒级生效！")
+                return True
+            else:
+                print(f"⚠️ API 返回状态码 {res.status_code}: {res.text[:100]}")
+        except Exception as e:
+            print(f"⚠️ API 请求异常: {e}")
+            break
+
+    return False
 
 def format_cookies_for_playwright(raw_cookies):
     cleaned_cookies = []
@@ -70,39 +119,33 @@ def format_cookies_for_playwright(raw_cookies):
         cleaned_cookies.append(cookie)
     return cleaned_cookies
 
-async def run_automation():
-    if not COOKIES_JSON:
-        raise Exception("未配置 COOKIES_JSON 环境变量，请检查 GitHub Secrets 配置！")
-
-    try:
-        raw_cookies = json.loads(COOKIES_JSON)
-        formatted_cookies = format_cookies_for_playwright(raw_cookies)
-    except Exception as e:
-        raise Exception(f"COOKIES_JSON 解析失败: {str(e)}")
-
-    print("\n==========================================")
-    print("🚀 开始访问 Rustix 服务器控制台页面")
-    print("==========================================")
+async def run_playwright_automation(raw_cookies):
+    """【方案二】：Playwright 模拟浏览器（带 SOCKS5 代理及 SSL 错误检测）"""
+    print("\n🌐 [方案二] 启动 Playwright 自动化浏览器...")
+    formatted_cookies = format_cookies_for_playwright(raw_cookies)
 
     async with async_playwright() as p:
+        # 优先选择 SOCKS5 代理避免 HTTP SSL 握手断开
+        selected_proxy = None
+        if check_port("127.0.0.1", 10808):
+            selected_proxy = {"server": SOCKS5_PROXY_URL}
+            print(f"🌐 检测到 SOCKS5 代理可用，使用: {SOCKS5_PROXY_URL}")
+        elif check_port("127.0.0.1", 10809):
+            selected_proxy = {"server": HTTP_PROXY_URL}
+            print(f"🌐 使用 HTTP 代理: {HTTP_PROXY_URL}")
+        else:
+            raise Exception("代理端口 (10808 / 10809) 均未连通！")
+
         launch_options = {
             "headless": False,
-            "ignore_default_args": ["--enable-automation"],
+            "proxy": selected_proxy,
             "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-quic",
-                "--window-size=1366,768"
+                "--ignore-certificate-errors",
+                "--disable-blink-features=AutomationControlled"
             ]
         }
-
-        if PROXY_URL and check_proxy_port(PROXY_URL):
-            print(f"🌐 节点代理正常运行，正在通过 HTTP 隧道代理访问: {PROXY_URL}")
-            launch_options["proxy"] = {"server": PROXY_URL}
-        else:
-            raise Exception("本地 sing-box 代理未正常启动 (端口 10809 未连通)！")
 
         browser = await p.chromium.launch(**launch_options)
         context = await browser.new_context(
@@ -111,105 +154,77 @@ async def run_automation():
             locale="ru-RU"
         )
 
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
-
-        print("🔑 正在注入账号 Session Cookie...")
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
         await context.add_cookies(formatted_cookies)
-
         page = await context.new_page()
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                print(f"🌐 访问控制台: {CONSOLE_URL} (尝试 {attempt + 1}/{max_retries})...")
-                await page.goto(CONSOLE_URL, wait_until="commit", timeout=25000)
-                break
-            except Exception as e:
-                print(f"⚠️ 页面响应延迟 ({e})，等待 5 秒重试...")
-                if attempt == max_retries - 1:
-                    raise Exception(f"通过代理连接控制台失败: {e}")
-                await asyncio.sleep(5)
+        print(f"🌐 打开控制台: {CONSOLE_URL} ...")
+        await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=40000)
+        await asyncio.sleep(6)
 
-        print("⏳ 等待页面 DOM 加载与 Cloudflare/Mitelis 校验 (8秒)...")
-        await asyncio.sleep(8)
-
-        try:
-            current_content = await page.content()
-        except Exception:
-            current_content = ""
-
-        if "Access denied" in current_content:
-            await page.screenshot(path="access_denied_block.png")
-            raise Exception("提示 Access denied，请确认节点 IP 或更新最新 Cookie！")
+        content = await page.content()
+        
+        # 🚨 严格检测 SSL 及代理网络报错
+        if "ERR_SSL_PROTOCOL_ERROR" in content or "This site can" in content or "ERR_CONNECTION_CLOSED" in content:
+            await page.screenshot(path="ssl_error.png")
+            raise Exception("代理 TLS 握手失败，浏览器拦截为 ERR_SSL_PROTOCOL_ERROR，请更换代理节点！")
 
         if "login" in page.url or "auth" in page.url:
             await page.screenshot(path="login_failed.png")
-            raise Exception("Cookie 已失效，面板将其重定向回了登录页，请重新导出最新 Cookie！")
+            raise Exception("Cookie 已失效，已跳至登录页，请更新 COOKIES_JSON！")
 
-        print("✅ 防火墙与 Session 校验成功，已进入控制台！")
+        print("✅ 网页成功加载！真正进入了 Rustix 控制台。")
 
-        print("⏳ 正在等待前端 WebSocket 与控制按钮完全加载渲染 (8秒)...")
-        await asyncio.sleep(8)
-
-        # 💡 终极定位方案：直接在浏览器内部注入 JS 遍历页面元素，精准识别并点击【Старт】或【Рестарт】
+        # 注入原生 JS 进行全节点暴力点击
         click_result = await page.evaluate("""
             () => {
-                const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
-                
-                // 寻找开机按钮 (Старт / Start)
+                const candidates = Array.from(document.querySelectorAll('*'));
                 for (const el of candidates) {
                     const txt = (el.innerText || el.textContent || '').trim();
-                    if (/^(Старт|Start)$/i.test(txt) || txt.includes('Старт')) {
-                        // 找最近的可点击父节点或自身
-                        const clickable = el.closest('button, a, div[role="button"]') || el;
-                        clickable.click();
-                        return { success: true, action: 'Старт (开机)', text: txt };
+                    if (/^(Старт|Start|Рестарт|Restart)$/i.test(txt)) {
+                        el.click();
+                        return { success: true, text: txt };
                     }
                 }
-                
-                // 寻找重启按钮 (Рестарт / Restart)
-                for (const el of candidates) {
-                    const txt = (el.innerText || el.textContent || '').trim();
-                    if (/^(Рестарт|Restart)$/i.test(txt) || txt.includes('Рестарт')) {
-                        const clickable = el.closest('button, a, div[role="button"]') || el;
-                        clickable.click();
-                        return { success: true, action: 'Рестарт (重启)', text: txt };
-                    }
-                }
-                
                 return { success: false };
             }
         """)
 
         if click_result and click_result.get("success"):
-            action_name = click_result.get("action")
-            print(f"🎉 JS 精准匹配并成功点击了按钮:【{action_name}】！")
-            await asyncio.sleep(6)
+            txt = click_result.get("text")
+            print(f"🎉 成功匹配并触发控制按钮:【{txt}】！")
+            await asyncio.sleep(5)
             await page.screenshot(path="after_click.png")
-            send_tg_message(f"🖥️ 服务器保活指令已发出: {action_name} 🚀\n💡 已成功触发控制台按钮。")
+            send_tg_message(f"🖥️ 控制台按钮成功触发: {txt} 🚀")
         else:
-            # 兜底：如果 JS 全文查找未果，强行点击页面顶栏右侧的第一个按钮容器
-            print("⚠️ 未匹配到指定俄文文本，尝试针对控制台顶部按钮区域进行点击...")
-            top_buttons = page.locator('div[class*="flex"] > button, div[class*="flex"] > div[class*="cursor-pointer"]')
-            if await top_buttons.count() > 0:
-                await top_buttons.first.click(force=True)
-                await asyncio.sleep(6)
-                await page.screenshot(path="after_click.png")
-                send_tg_message("🖥️ 服务器保活指令已发出 🚀\n💡 已成功点击顶部控制按钮。")
-            else:
-                await page.screenshot(path="button_not_found.png")
-                raise Exception("未能在控制台页面匹配到可操作按钮，截图已保存为 button_not_found.png。")
+            await page.screenshot(path="button_not_found.png")
+            raise Exception("控制台渲染完成但未找到 Start/Restart 控件。")
 
         await browser.close()
 
 async def main():
+    if not COOKIES_JSON:
+        print("❌ 未配置 COOKIES_JSON！")
+        sys.exit(1)
+
     try:
-        await run_automation()
+        raw_cookies = json.loads(COOKIES_JSON)
+    except Exception as e:
+        print(f"❌ COOKIES_JSON 解析失败: {e}")
+        sys.exit(1)
+
+    # 1. 优先采用轻量快速的 API 直连方式
+    if try_api_power_trigger(raw_cookies):
+        print("✅ API 执行成功，程序退出。")
+        sys.exit(0)
+
+    # 2. 若 API 失败，自动降级回 Playwright 模拟
+    print("⚠️ API 直连未成功，自动降级使用 Playwright 浏览器模式...")
+    try:
+        await run_playwright_automation(raw_cookies)
     except Exception as e:
         error_msg = str(e)
-        print(f"\n❌ 脚本运行出错: {error_msg}")
+        print(f"\n❌ 运行出错: {error_msg}")
         send_tg_message(f"⚠️ 脚本运行出现错误！\n\n错误详情:\n{error_msg}")
         sys.exit(1)
 
