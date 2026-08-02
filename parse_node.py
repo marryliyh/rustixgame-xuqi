@@ -10,7 +10,6 @@ if not node_link:
     sys.exit(1)
 
 def parse_link(link):
-    # 处理带 Fragment (#) 的链接
     parsed = urllib.parse.urlparse(link)
     scheme = parsed.scheme.lower()
     query = urllib.parse.parse_qs(parsed.query)
@@ -38,7 +37,6 @@ def parse_link(link):
         security = get_q("security")
         net_type = get_q("type", "tcp")
         
-        # 传输层配置 (WS / gRPC / TCP)
         if net_type == "ws":
             outbound["transport"] = {
                 "type": "ws",
@@ -51,7 +49,6 @@ def parse_link(link):
                 "service_name": get_q("serviceName")
             }
 
-        # TLS / Reality 核心参数解析
         if security in ["tls", "reality"]:
             sni = get_q("sni") or get_q("peer") or host
             fp = get_q("fp", "chrome")
@@ -124,10 +121,10 @@ try:
         "log": {"level": "info"},
         "inbounds": [
             {
-                "type": "socks",
-                "tag": "socks-in",
+                "type": "mixed", # 💡 启用 mixed 模式，同时支持 HTTP (10809) 和 SOCKS5 (10808)
+                "tag": "mixed-in",
                 "listen": "127.0.0.1",
-                "listen_port": 10808
+                "listen_port": 10809
             }
         ],
         "outbounds": [
@@ -137,7 +134,7 @@ try:
     }
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    print("✅ 已成功解析 VLESS Reality 节点并写入 sing-box 配置文件！")
+    print("✅ 已成功写入 sing-box HTTP/Mixed 代理配置文件 (127.0.0.1:10809)！")
 except Exception as e:
     print(f"❌ 解析 NODE_LINK 失败: {e}")
     sys.exit(1)
