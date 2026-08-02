@@ -21,27 +21,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 🚀 自动解析节点链接并启动 sing-box 本地 SOCKS5 代理
+      # 🚀 解析节点并启动 sing-box 代理
       - name: Parse Node Link & Start Proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           if [ -z "$NODE_LINK" ]; then
-            echo "⚠️ 未配置 NODE_LINK Secrets，跳过代理启动。"
+            echo "❌ 错误: 未在仓库 Secrets 配置 NODE_LINK！"
+            exit 1
           else
-            echo "📥 正在下载 sing-box 内核..."
+            echo "📥 下载 sing-box 内核..."
             curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz | tar -xz
             mv sing-box-*/sing-box ./sing-box
+            chmod +x ./sing-box
 
-            echo "⚡ 正在解析节点链接..."
+            echo "⚡ 解析节点链接..."
             python parse_node.py
 
             echo "🚀 启动后台代理 (127.0.0.1:10808)..."
-            ./sing-box run -c config.json &
-            sleep 4
+            ./sing-box run -c config.json > singbox.log 2>&1 &
+            sleep 5
             
-            echo "🌐 测试节点代理连通性与出口 IP："
-            curl -x socks5://127.0.0.1:10808 -s https://api.ipify.org || true
+            echo "📊 --- sing-box 启动日志 ---"
+            cat singbox.log || true
+            echo "---------------------------"
+
+            echo "🌐 测试节点代理连通性："
+            curl -x socks5://127.0.0.1:10808 -s https://api.ipify.org || echo "⚠️ 代理端口尚未成功建立连接"
             echo ""
           fi
 
@@ -61,13 +67,15 @@ jobs:
           PROXY_URL: socks5://127.0.0.1:10808
         run: xvfb-run --auto-servernum python rustix.py
 
-      # 上传截图产物
-      - name: Upload Screenshots Artifact
+      # 上传截图与日志
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cloudflare-screenshots
-          path: '*.png'
+          name: run-artifacts
+          path: |
+            *.png
+            singbox.log
 
       # 清理历史运行记录
       - name: Delete old workflow runs
