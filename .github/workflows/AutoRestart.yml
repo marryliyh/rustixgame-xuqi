@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 使用 Cloudflare WARP 伪装 IP 绕过机房 IP 拦截
+      # 使用 Cloudflare WARP 伪装 IP
       - name: Setup Cloudflare WARP
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -49,6 +49,14 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
         run: xvfb-run --auto-servernum python rustix.py
+
+      # 📸 增加截图文件自动上传功能（无论脚本成功与否都会执行）
+      - name: Upload Screenshots Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-screenshots
+          path: '*.png'
 
       # 自动清理历史 Action 记录，只留最后 1 条
       - name: Delete old workflow runs
