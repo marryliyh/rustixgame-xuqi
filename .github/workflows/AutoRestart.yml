@@ -34,7 +34,7 @@ jobs:
             mv sing-box-*/sing-box ./sing-box
 
             echo "⚡ 正在解析节点链接并生成代理配置..."
-            python3 -c '
+            python3 - << 'EOF'
 import os, sys, json, base64
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -135,7 +135,7 @@ config = {
 with open("config.json", "w") as f:
     json.dump(config, f, indent=2)
 print("✅ 节点配置转换成功！")
-'
+EOF
 
             echo "🚀 启动后台节点服务 (127.0.0.1:10808)..."
             ./sing-box run -c config.json &
