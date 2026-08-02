@@ -1,6 +1,7 @@
 import os
 import json
 import urllib.parse
+import html
 import sys
 
 node_link = os.environ.get("NODE_LINK", "").strip()
@@ -10,6 +11,8 @@ if not node_link:
     sys.exit(1)
 
 def parse_link(link):
+    # GitHub Secret 里若粘贴了网页转义后的链接，把 &amp; 还原为 &。
+    link = html.unescape(link.strip())
     parsed = urllib.parse.urlparse(link)
     scheme = parsed.scheme.lower()
     query = urllib.parse.parse_qs(parsed.query)
@@ -78,7 +81,8 @@ def parse_link(link):
         host = parsed.hostname
         port = parsed.port or 443
         sni = get_q("sni") or host
-        insecure = get_q("insecure") in ["1", "true"]
+        insecure_value = (get_q("insecure") or get_q("allowInsecure")).strip().lower()
+        insecure = insecure_value in ["1", "true", "yes"]
         
         outbound = {
             "type": "hysteria2",
@@ -113,6 +117,8 @@ def parse_link(link):
     else:
         raise Exception(f"暂不支持的协议类型: {scheme}")
 
+    if not outbound.get("server"):
+        raise Exception("节点链接缺少服务器地址")
     return outbound
 
 try:
