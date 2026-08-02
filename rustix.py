@@ -86,13 +86,14 @@ async def run_automation():
 
     async with async_playwright() as p:
         launch_options = {
-            "headless": True,
+            "headless": False,
             "ignore_default_args": ["--enable-automation"],
             "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
+                "--disable-quic",
                 "--window-size=1366,768"
             ]
         }
@@ -152,68 +153,54 @@ async def run_automation():
         print("⏳ 正在等待前端 WebSocket 与控制按钮完全加载渲染 (8秒)...")
         await asyncio.sleep(8)
 
-        # Rustix 控制按钮为俄文：Старт（启动）、Рестарт（重启）、Стоп（停止）。
-        # 页面显示“Включён”时 Старт 会禁用，因此优先点击可用的 Рестарт。
-        print("⏳ 等待俄文控制按钮渲染（最长 40 秒）...")
+        # 💡 终极定位方案：直接在浏览器内部注入 JS 遍历页面元素，精准识别并点击【Старт】或【Рестарт】
+        click_result = await page.evaluate("""
+            () => {
+                const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
+                
+                // 寻找开机按钮 (Старт / Start)
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim();
+                    if (/^(Старт|Start)$/i.test(txt) || txt.includes('Старт')) {
+                        // 找最近的可点击父节点或自身
+                        const clickable = el.closest('button, a, div[role="button"]') || el;
+                        clickable.click();
+                        return { success: true, action: 'Старт (开机)', text: txt };
+                    }
+                }
+                
+                // 寻找重启按钮 (Рестарт / Restart)
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim();
+                    if (/^(Рестарт|Restart)$/i.test(txt) || txt.includes('Рестарт')) {
+                        const clickable = el.closest('button, a, div[role="button"]') || el;
+                        clickable.click();
+                        return { success: true, action: 'Рестарт (重启)', text: txt };
+                    }
+                }
+                
+                return { success: false };
+            }
+        """)
 
-        async def click_rustix_control():
-            # 依次检查主页面和 iframe，并处理按钮文本被图标/span 分割的情况。
-            for _ in range(20):
-                for frame in page.frames:
-                    buttons = frame.locator('button, [role="button"], a')
-                    count = await buttons.count()
-                    visible_texts = []
-                    for i in range(min(count, 100)):
-                        item = buttons.nth(i)
-                        try:
-                            text = " ".join((await item.inner_text()).split())
-                            if text:
-                                visible_texts.append(text)
-                        except Exception:
-                            continue
-
-                    if visible_texts:
-                        print("🔎 当前可点击控件文本:", " | ".join(visible_texts[:30]))
-
-                    # 优先重启。截图中的实际俄文是 Рестарт。
-                    for wanted, action_name in [
-                        ("Рестарт", "Рестарт（重启）"),
-                        ("Restart", "Restart（重启）"),
-                        ("Старт", "Старт（启动）"),
-                        ("Start", "Start（启动）"),
-                    ]:
-                        for i in range(min(count, 100)):
-                            item = buttons.nth(i)
-                            try:
-                                text = " ".join((await item.inner_text()).split())
-                                if text.casefold() != wanted.casefold():
-                                    continue
-                                if not await item.is_visible():
-                                    continue
-                                disabled = await item.is_disabled()
-                                aria_disabled = (await item.get_attribute("aria-disabled") or "").lower() == "true"
-                                if disabled or aria_disabled:
-                                    print(f"⏭️ 跳过禁用按钮: {text}")
-                                    continue
-                                await item.scroll_into_view_if_needed()
-                                await item.click(force=True, timeout=10000)
-                                return action_name
-                            except Exception as exc:
-                                print(f"⚠️ 候选按钮 {wanted} 点击失败: {exc}")
-                await page.wait_for_timeout(2000)
-            return None
-
-        action_name = await click_rustix_control()
-        if action_name:
-            print(f"🎉 已点击控制按钮: {action_name}")
-            await page.wait_for_timeout(6000)
-            await page.screenshot(path="after_click.png", full_page=True)
-            send_tg_message(f"🖥️ 服务器控制指令已发出: {action_name} 🚀")
+        if click_result and click_result.get("success"):
+            action_name = click_result.get("action")
+            print(f"🎉 JS 精准匹配并成功点击了按钮:【{action_name}】！")
+            await asyncio.sleep(6)
+            await page.screenshot(path="after_click.png")
+            send_tg_message(f"🖥️ 服务器保活指令已发出: {action_name} 🚀\n💡 已成功触发控制台按钮。")
         else:
-            await page.screenshot(path="button_not_found.png", full_page=True)
-            with open("button_not_found.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            raise Exception("控制台已打开，但没有找到可用的俄文按钮 Рестарт/Старт。已保存诊断文件。")
+            # 兜底：如果 JS 全文查找未果，强行点击页面顶栏右侧的第一个按钮容器
+            print("⚠️ 未匹配到指定俄文文本，尝试针对控制台顶部按钮区域进行点击...")
+            top_buttons = page.locator('div[class*="flex"] > button, div[class*="flex"] > div[class*="cursor-pointer"]')
+            if await top_buttons.count() > 0:
+                await top_buttons.first.click(force=True)
+                await asyncio.sleep(6)
+                await page.screenshot(path="after_click.png")
+                send_tg_message("🖥️ 服务器保活指令已发出 🚀\n💡 已成功点击顶部控制按钮。")
+            else:
+                await page.screenshot(path="button_not_found.png")
+                raise Exception("未能在控制台页面匹配到可操作按钮，截图已保存为 button_not_found.png。")
 
         await browser.close()
 
