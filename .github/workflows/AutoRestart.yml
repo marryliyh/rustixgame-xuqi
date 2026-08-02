@@ -35,17 +35,20 @@ jobs:
           echo "🌐 WARP 状态检查："
           curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip|warp" || true
 
-      - name: Install dependencies
+      # 安装 Xvfb (虚拟显示) 和 playwright-stealth 抗检测库
+      - name: Install dependencies & Xvfb
         run: |
-          pip install playwright requests
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install playwright requests playwright-stealth
           playwright install chromium
 
-      - name: Run script
+      # 通过 xvfb-run 以有头模式 (GUI) 运行 Python 脚本
+      - name: Run script with Xvfb
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
-        run: python rustix.py
+        run: xvfb-run --auto-servernum python rustix.py
 
       # 自动清理历史 Action 记录，只留最后 1 条
       - name: Delete old workflow runs
