@@ -1,4 +1,4 @@
-name: Rustix Auto Restart
+name: Rustix Auto Restart via VPS SSH
 
 on:
   schedule:
@@ -22,33 +22,82 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install sing-box and start proxy
+      - name: Install SSH client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client curl
+
+      - name: Configure SSH key
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           set -euo pipefail
-          test -n "$NODE_LINK" || { echo "NODE_LINK 未配置"; exit 1; }
-          curl -fL --retry 3 -o sing-box.tar.gz             https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
-          tar -xzf sing-box.tar.gz
-          mv sing-box-*/sing-box ./sing-box
-          chmod +x ./sing-box
-          python parse_node.py
-          ./sing-box check -c config.json
-          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-          echo $! > singbox.pid
-          sleep 8
-          kill -0 "$(cat singbox.pid)" || { cat singbox.log; exit 1; }
-          cat singbox.log || true
+          test -n "$SSH_PRIVATE_KEY" || { echo "SSH_PRIVATE_KEY 未配置"; exit 1; }
+          test -n "$SSH_HOST" || { echo "SSH_HOST 未配置"; exit 1; }
+          SSH_PORT="${SSH_PORT:-22}"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_vps
+          chmod 600 ~/.ssh/id_vps
+          ssh-keygen -y -f ~/.ssh/id_vps > /dev/null || {
+            echo "SSH_PRIVATE_KEY 无效，必须填写完整 OpenSSH 私钥";
+            exit 1;
+          }
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null || {
+            echo "无法获取 VPS SSH 主机密钥，请检查 SSH_HOST 和 SSH_PORT";
+            exit 1;
+          }
+          chmod 600 ~/.ssh/known_hosts
 
-      - name: Verify proxy path
+      - name: Start VPS SSH SOCKS5 tunnel
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
         run: |
-          set -o pipefail
-          echo "===== 出口 IP ====="
-          curl --socks5-hostname 127.0.0.1:10808 --connect-timeout 15 --max-time 30             -fsS https://api.ipify.org && echo
-          echo "===== Rustix HTTPS ====="
-          curl --socks5-hostname 127.0.0.1:10808 --connect-timeout 20 --max-time 40             -sS -D rustix_headers.txt -o rustix_probe.html https://my.rustix.me/ || {
-              echo "Rustix HTTPS 预检失败";
-              cat singbox.log || true;
+          set -euo pipefail
+          test -n "$SSH_USER" || { echo "SSH_USER 未配置"; exit 1; }
+          SSH_PORT="${SSH_PORT:-22}"
+          ssh -i ~/.ssh/id_vps \
+            -p "$SSH_PORT" \
+            -N -D 127.0.0.1:10808 \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            "$SSH_USER@$SSH_HOST" \
+            > ssh_tunnel.log 2>&1 &
+          echo $! > ssh_tunnel.pid
+          sleep 5
+          kill -0 "$(cat ssh_tunnel.pid)" || {
+            echo "SSH 隧道启动失败";
+            cat ssh_tunnel.log || true;
+            exit 1;
+          }
+          timeout 3 bash -c '</dev/tcp/127.0.0.1/10808' || {
+            echo "本地 SOCKS5 端口 10808 未监听";
+            cat ssh_tunnel.log || true;
+            exit 1;
+          }
+          echo "SSH SOCKS5 隧道已启动：127.0.0.1:10808"
+
+      - name: Verify VPS exit and Rustix access
+        run: |
+          set -euo pipefail
+          echo "===== VPS 出口 IP ====="
+          curl --socks5-hostname 127.0.0.1:10808 \
+            --connect-timeout 15 --max-time 30 \
+            -fsS https://api.ipify.org | tee vps_exit_ip.txt
+          echo
+          echo "===== Rustix HTTPS 预检 ====="
+          curl --socks5-hostname 127.0.0.1:10808 \
+            --connect-timeout 20 --max-time 40 \
+            -sS -D rustix_headers.txt -o rustix_probe.html \
+            https://my.rustix.me/ || {
+              echo "通过 VPS 访问 Rustix 失败";
+              cat ssh_tunnel.log || true;
               exit 1;
             }
           head -n 20 rustix_headers.txt || true
@@ -58,7 +107,7 @@ jobs:
           pip install playwright requests
           playwright install --with-deps chromium
 
-      - name: Run Rustix automation
+      - name: Run Rustix automation through VPS
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -70,14 +119,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rustix-run-${{ github.run_number }}
+          name: rustix-vps-ssh-${{ github.run_number }}
           if-no-files-found: ignore
           path: |
             *.png
             *.html
             *.txt
-            singbox.log
-            config.json
+            ssh_tunnel.log
 
       - name: Delete old workflow runs
         if: always()
