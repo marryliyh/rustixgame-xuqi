@@ -4,7 +4,6 @@ import os
 import json
 import sys
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 # --- 从环境变量读取敏感信息 ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
@@ -37,9 +36,10 @@ async def process_account(account):
     print(f"==========================================")
 
     async with async_playwright() as p:
-        # 配合 xvfb 使用有头模式 (headless=False) 绕过 CF 人机检测
+        # 核心改动：ignore_default_args 去掉 chromium 自带的 --enable-automation
         browser = await p.chromium.launch(
             headless=False,
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -54,15 +54,15 @@ async def process_account(account):
             locale="ru-RU"
         )
 
-        # 擦除 webdriver 自动化标记
+        # 原生注入全套 Anti-Detection 指纹伪装
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+            window.chrome = { runtime: {} };
         """)
 
         page = await context.new_page()
-
-        # 应用全套 stealth 抗检测伪装
-        await stealth_async(page)
 
         # 1. 打开登录页面
         print(f"🌐 1/4 打开登录页面: {LOGIN_URL}")
@@ -73,7 +73,7 @@ async def process_account(account):
 
         print("⏳ 等待页面与 Cloudflare 验证加载完成...")
         
-        # 显式等待登录输入框出现（最多等待 35 秒，给 CF 充分时间通过验证）
+        # 显式等待登录输入框出现（最多等待 35 秒）
         try:
             await page.wait_for_selector(
                 'input[type="text"], input[type="email"], input[name="username"], input[name="email"], input[type="password"]',
