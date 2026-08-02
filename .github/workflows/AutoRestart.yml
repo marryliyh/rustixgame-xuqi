@@ -35,11 +35,11 @@ jobs:
           echo "🌐 WARP 状态检查："
           curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip|warp" || true
 
-      # 安装 Xvfb (虚拟显示) 和 playwright-stealth 抗检测库
+      # 安装 Xvfb (虚拟显示) 
       - name: Install dependencies & Xvfb
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
-          pip install playwright requests playwright-stealth
+          pip install playwright requests
           playwright install chromium
 
       # 通过 xvfb-run 以有头模式 (GUI) 运行 Python 脚本
