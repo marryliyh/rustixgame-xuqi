@@ -70,8 +70,10 @@ jobs:
             }
           head -n 20 rustix_headers.txt || true
 
-      - name: Install Playwright Chromium
+      - name: Install Playwright Chromium and Xvfb
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
           pip install playwright requests
           playwright install --with-deps chromium
 
@@ -81,7 +83,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
           PROXY_URL: socks5://127.0.0.1:10808
-        run: python rustix.py
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python rustix.py
 
       - name: Upload diagnostics
         if: always()
