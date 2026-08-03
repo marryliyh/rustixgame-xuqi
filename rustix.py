@@ -15,6 +15,8 @@ COOKIES_JSON = os.getenv("COOKIES_JSON", "")
 PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 CONSOLE_URL = os.getenv("CONSOLE_URL", "https://my.rustix.me/server/226fd977/console")
 
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
 NETWORK_MARKERS = (
     "ERR_SSL_PROTOCOL_ERROR", "ERR_PROXY_CONNECTION_FAILED",
     "ERR_TUNNEL_CONNECTION_FAILED", "ERR_CONNECTION_RESET",
@@ -62,7 +64,8 @@ def normalize_cookies(value):
         if not c.get("name") or c.get("value") is None:
             continue
         item = {
-            "name": c["name"], "value": str(c["value"]),
+            "name": c["name"],
+            "value": str(c["value"]),
             "path": c.get("path", "/"),
             "secure": bool(c.get("secure", True)),
             "httpOnly": bool(c.get("httpOnly", False)),
@@ -71,6 +74,7 @@ def normalize_cookies(value):
             item["domain"] = c["domain"]
         else:
             item["url"] = "https://my.rustix.me"
+            
         same = str(c.get("sameSite", "")).lower()
         if same in ("none", "no_restriction"):
             item["sameSite"] = "None"
@@ -78,6 +82,7 @@ def normalize_cookies(value):
             item["sameSite"] = "Lax"
         elif same == "strict":
             item["sameSite"] = "Strict"
+            
         expires = c.get("expirationDate", c.get("expires"))
         if expires:
             try:
@@ -104,8 +109,51 @@ async def save_diagnostics(page, prefix):
         print(f"保存部分诊断文件失败: {exc}")
 
 
+async def inject_stealth(context):
+    """注入高级伪装脚本，避开 Mitelis/Cloudflare 防火墙指纹检测"""
+    stealth_js = """
+    // 1. 抹除 navigator.webdriver 特征
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // 2. 伪造 window.chrome 运行库
+    window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+    };
+
+    // 3. 伪造 Permissions API
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+    );
+
+    // 4. 伪造 Plugins 与 MimeTypes
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbheakdddfldooefmcfdefgakmcbq', description: '' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+        ],
+    });
+
+    // 5. 伪造 WebGL 硬件指纹 (NVIDIA 显卡)
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter.apply(this, [parameter]);
+        };
+    } catch (e) {}
+    """
+    await context.add_init_script(stealth_js)
+
+
 async def click_in_frame(frame):
-    # First use accessible locators. This covers native buttons and most UI libraries.
     for action, labels in BUTTONS:
         for label in labels:
             pattern = re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
@@ -134,7 +182,6 @@ async def click_in_frame(frame):
                 except Exception:
                     pass
 
-    # Deep fallback traverses open shadow roots and clicks the smallest exact-text node.
     try:
         result = await frame.evaluate("""
         (groups) => {
@@ -181,7 +228,6 @@ async def click_in_frame(frame):
 
 
 async def find_and_click(page):
-    # Frontend/WebSocket rendering can be slow. Search main document and every iframe for 60 seconds.
     for attempt in range(20):
         for frame in page.frames:
             result = await click_in_frame(frame)
@@ -200,38 +246,77 @@ async def run():
     cookies = normalize_cookies(COOKIES_JSON)
 
     print("==========================================")
-    print("开始访问 Rustix 控制台")
+    print("开始访问 Rustix 控制台 (Mitelis 防火墙伪装模式)")
     print(f"代理: {PROXY_URL}")
     print("==========================================")
 
     async with async_playwright() as p:
+        # 💡 关键点 1: headless=False (配合 Xvfb 实现真实界面运行，规避无头检测)
+        # 💡 关键点 2: ignore_default_args 屏蔽自动化标识
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
+            ignore_default_args=["--enable-automation"],
             proxy={"server": PROXY_URL},
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-quic"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-quic",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1366,768",
+            ],
         )
-        context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="ru-RU")
+
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=USER_AGENT,
+            locale="ru-RU",
+            extra_http_headers={
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+            }
+        )
+
+        # 💡 关键点 3: 注入防护层伪装逻辑
+        await inject_stealth(context)
         await context.add_cookies(cookies)
         page = await context.new_page()
 
         response = await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
+        
+        # 模拟真人鼠标微动，协助通过隐式 JavaScript 验证
+        await page.mouse.move(100, 100)
         await page.wait_for_timeout(8000)
+
         body = await page.locator("body").inner_text(timeout=10000)
         combined = f"{page.url}\n{body}"
+
         for marker in NETWORK_MARKERS:
             if marker.lower() in combined.lower():
                 await save_diagnostics(page, "network_error")
                 raise RuntimeError(f"页面网络错误: {marker}")
+
         if response and response.status >= 400:
             await save_diagnostics(page, "http_error")
             raise RuntimeError(f"Rustix 返回 HTTP {response.status}")
+
         if "access denied" in body.lower():
-            await save_diagnostics(page, "access_denied")
-            raise RuntimeError("Rustix/Mitelis 返回 Access denied")
+            # 尝试等待 10 秒看 Mitelis 的 JavaScript 挑战是否自动通过
+            print("⚠️ 检测到 Access denied，等待 Mitelis 自动验证跳转...")
+            await page.wait_for_timeout(10000)
+            body = await page.locator("body").inner_text(timeout=5000)
+            if "access denied" in body.lower():
+                await save_diagnostics(page, "access_denied")
+                raise RuntimeError("Rustix/Mitelis 返回 Access denied (伪装未能绕过防护)")
+
         if "login" in page.url.lower() or "auth" in page.url.lower():
             await save_diagnostics(page, "login_failed")
             raise RuntimeError("Cookie 已失效，已跳转登录页")
 
+        print("✅ 防火墙通过，进入面板，开始匹配按钮...")
         result = await find_and_click(page)
         if not result:
             await save_diagnostics(page, "button_not_found")
