@@ -8,7 +8,7 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
       actions: write
       contents: read
@@ -47,41 +47,13 @@ jobs:
             exit 1
           fi
 
-      - name: Verify NODE_LINK proxy
-        run: |
-          set -euo pipefail
-          echo "===== 节点出口 IP ====="
-          curl --socks5-hostname 127.0.0.1:10808 \
-            --connect-timeout 15 --max-time 30 \
-            -fsS https://api.ipify.org | tee node_exit_ip.txt
-          echo
-
-      - name: Install Dependencies, Google Chrome, and Xvfb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          pip install playwright requests curl_cffi
-          playwright install chrome
-          playwright install-deps
-
       - name: Run Rustix automation
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          COOKIES_JSON: ${{ secrets.COOKIES_JSON }}
+          API_KEY: ${{ secrets.API_KEY }}
           PROXY_URL: socks5://127.0.0.1:10808
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python rustix.py
-
-      - name: Upload diagnostics screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustix-status-screenshots-${{ github.run_number }}
-          if-no-files-found: ignore
-          path: |
-            *.png
-            *.html
-            singbox.log
+        run: python rustix.py
 
       - name: Delete old workflow runs
         if: always()
