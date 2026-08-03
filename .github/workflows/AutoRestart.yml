@@ -61,7 +61,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
           pip install playwright requests curl_cffi
-          # 💡 安装官方正版 Google Chrome 以突破 TLS 校验
           playwright install chrome
           playwright install-deps
 
@@ -73,11 +72,11 @@ jobs:
           PROXY_URL: socks5://127.0.0.1:10808
         run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python rustix.py
 
-      - name: Upload diagnostics
+      - name: Upload diagnostics screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rustix-diagnostics-${{ github.run_number }}
+          name: rustix-status-screenshots-${{ github.run_number }}
           if-no-files-found: ignore
           path: |
             *.png
