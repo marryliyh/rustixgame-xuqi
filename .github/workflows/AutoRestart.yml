@@ -47,9 +47,6 @@ jobs:
             exit 1
           fi
 
-          echo "===== sing-box 日志 ====="
-          cat singbox.log || true
-
       - name: Verify NODE_LINK proxy
         run: |
           set -euo pipefail
@@ -58,17 +55,6 @@ jobs:
             --connect-timeout 15 --max-time 30 \
             -fsS https://api.ipify.org | tee node_exit_ip.txt
           echo
-
-          echo "===== Rustix HTTPS 预检 ====="
-          curl --socks5-hostname 127.0.0.1:10808 \
-            --connect-timeout 20 --max-time 40 \
-            -sS -D rustix_headers.txt -o rustix_probe.html \
-            https://my.rustix.me/ || {
-              echo "NODE_LINK 无法访问 Rustix"
-              cat singbox.log || true
-              exit 1
-            }
-          head -n 20 rustix_headers.txt || true
 
       - name: Install Playwright Chromium and Xvfb
         run: |
@@ -96,7 +82,6 @@ jobs:
             *.html
             *.txt
             singbox.log
-            config.json
 
       - name: Delete old workflow runs
         if: always()
