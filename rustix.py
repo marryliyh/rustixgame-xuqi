@@ -4,9 +4,16 @@ import os
 import re
 import socket
 import sys
-from urllib.parse import urlparse
-
+from urllib.parse import urlparse, unquote
 import requests
+
+# 导入 curl_cffi 用于绕过 Mitelis TLS 指纹检测
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+
 from playwright.async_api import async_playwright
 
 TG_TOKEN = os.getenv("TG_TOKEN", "")
@@ -14,6 +21,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 COOKIES_JSON = os.getenv("COOKIES_JSON", "")
 PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 CONSOLE_URL = os.getenv("CONSOLE_URL", "https://my.rustix.me/server/226fd977/console")
+API_POWER_URL = "https://my.rustix.me/api/client/servers/226fd977/power"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -53,19 +61,29 @@ def proxy_port_ok(url):
         return False
 
 
-def normalize_cookies(value):
+def parse_cookie_dict(value):
     raw = json.loads(value)
     if isinstance(raw, dict):
         raw = raw.get("cookies", [])
     if not isinstance(raw, list):
-        raise ValueError("Cookie JSON 顶层必须是数组，或包含 cookies 数组")
-    result = []
+        raise ValueError("Cookie JSON 格式有误")
+    
+    cookie_dict = {}
+    xsrf_token = None
+    playwright_cookies = []
+
     for c in raw:
-        if not c.get("name") or c.get("value") is None:
+        name = c.get("name")
+        val = c.get("value")
+        if not name or val is None:
             continue
+        
+        cookie_dict[name] = str(val)
+        if name == "XSRF-TOKEN":
+            xsrf_token = unquote(str(val))
+
         item = {
-            "name": c["name"],
-            "value": str(c["value"]),
+            "name": name, "value": str(val),
             "path": c.get("path", "/"),
             "secure": bool(c.get("secure", True)),
             "httpOnly": bool(c.get("httpOnly", False)),
@@ -74,7 +92,7 @@ def normalize_cookies(value):
             item["domain"] = c["domain"]
         else:
             item["url"] = "https://my.rustix.me"
-            
+        
         same = str(c.get("sameSite", "")).lower()
         if same in ("none", "no_restriction"):
             item["sameSite"] = "None"
@@ -82,75 +100,66 @@ def normalize_cookies(value):
             item["sameSite"] = "Lax"
         elif same == "strict":
             item["sameSite"] = "Strict"
-            
+        
         expires = c.get("expirationDate", c.get("expires"))
         if expires:
             try:
                 item["expires"] = int(float(expires))
             except (TypeError, ValueError):
                 pass
-        result.append(item)
-    if not result:
-        raise ValueError("没有可用 Cookie")
-    return result
+        playwright_cookies.append(item)
+
+    return cookie_dict, xsrf_token, playwright_cookies
 
 
-async def save_diagnostics(page, prefix):
-    await page.screenshot(path=f"{prefix}.png", full_page=True)
+def try_cffi_bypass(cookie_dict, xsrf_token):
+    """【突破方案一】：利用 curl_cffi 伪造 100% 真实 Chrome TLS 握手，穿透 Mitelis 防火墙直连 API"""
+    if not HAS_CFFI:
+        print("⚠️ 未安装 curl_cffi，跳过 TLS 绕过模式")
+        return False
+
+    print("\n⚡ [方案一] 正在使用 curl_cffi 进行 Chrome TLS 指纹伪装直连...")
+    
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://my.rustix.me",
+        "Referer": CONSOLE_URL,
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
+
     try:
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(await page.content())
-        with open(f"{prefix}_text.txt", "w", encoding="utf-8") as f:
-            f.write(await page.locator("body").inner_text(timeout=5000))
-        frame_lines = [f"{i}: name={fr.name!r} url={fr.url}" for i, fr in enumerate(page.frames)]
-        with open(f"{prefix}_frames.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(frame_lines))
+        # 使用 impersonate="chrome124" 模仿真实 Chrome TLS 握手
+        session = cffi_requests.Session(impersonate="chrome124")
+        
+        # 预热请求获取并更新动态 Mitelis 凭证
+        warmup = session.get(CONSOLE_URL, headers=headers, cookies=cookie_dict, proxies={"https": PROXY_URL, "http": PROXY_URL}, timeout=15)
+        if "access denied" in warmup.text.lower():
+            print("⚠️ TLS 直连获取控制台依旧受阻，尝试直接发送 Power 指令...")
+
+        for action in ["restart", "start"]:
+            res = session.post(
+                API_POWER_URL,
+                json={"signal": action},
+                headers=headers,
+                cookies=cookie_dict,
+                proxies={"https": PROXY_URL, "http": PROXY_URL},
+                timeout=15
+            )
+            if res.status_code in (200, 204):
+                print(f"🎉 [Mitelis 突破成功] API 响应成功 (Status {res.status_code})！已发送 [{action}] 指令！")
+                notify(f"🚀 Mitelis 防火墙成功绕过！\n已通过 API 直连向服务器发送 [{action}] 成功！")
+                return True
+            else:
+                print(f"ℹ️ API 响应 Status {res.status_code}: {res.text[:120]}")
+
     except Exception as exc:
-        print(f"保存部分诊断文件失败: {exc}")
+        print(f"⚠️ curl_cffi 尝试过程出现异常: {exc}")
 
-
-async def inject_stealth(context):
-    """注入高级伪装脚本，避开 Mitelis/Cloudflare 防火墙指纹检测"""
-    stealth_js = """
-    // 1. 抹除 navigator.webdriver 特征
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-    // 2. 伪造 window.chrome 运行库
-    window.chrome = {
-        runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
-        app: {}
-    };
-
-    // 3. 伪造 Permissions API
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
-    );
-
-    // 4. 伪造 Plugins 与 MimeTypes
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbheakdddfldooefmcfdefgakmcbq', description: '' },
-            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-        ],
-    });
-
-    // 5. 伪造 WebGL 硬件指纹 (NVIDIA 显卡)
-    try {
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            return getParameter.apply(this, [parameter]);
-        };
-    } catch (e) {}
-    """
-    await context.add_init_script(stealth_js)
+    return False
 
 
 async def click_in_frame(frame):
@@ -181,79 +190,17 @@ async def click_in_frame(frame):
                         return action, label, frame.url
                 except Exception:
                     pass
-
-    try:
-        result = await frame.evaluate("""
-        (groups) => {
-          const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const collect = root => {
-            const out = [];
-            const walk = node => {
-              if (!node) return;
-              if (node.nodeType === 1) {
-                out.push(node);
-                if (node.shadowRoot) walk(node.shadowRoot);
-              }
-              for (const child of (node.children || [])) walk(child);
-            };
-            walk(root);
-            return out;
-          };
-          const all = collect(document.documentElement);
-          for (const group of groups) {
-            for (const label of group.labels) {
-              const wanted = norm(label);
-              const matches = all.filter(el => norm(el.innerText || el.textContent) === wanted);
-              matches.sort((a,b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
-              for (const el of matches) {
-                const target = el.closest('button,[role="button"],a,[tabindex]') || el;
-                const st = getComputedStyle(target);
-                const rect = target.getBoundingClientRect();
-                if (st.display === 'none' || st.visibility === 'hidden' || rect.width < 2 || rect.height < 2) continue;
-                if (target.disabled || target.getAttribute('aria-disabled') === 'true') continue;
-                target.scrollIntoView({block:'center'});
-                target.click();
-                return {action: group.action, label};
-              }
-            }
-          }
-          return null;
-        }
-        """, [{"action": a, "labels": list(labels)} for a, labels in BUTTONS])
-        if result:
-            return result["action"], result["label"], frame.url
-    except Exception:
-        pass
     return None
 
 
-async def find_and_click(page):
-    for attempt in range(20):
-        for frame in page.frames:
-            result = await click_in_frame(frame)
-            if result:
-                return result
-        print(f"等待控制按钮渲染: {attempt + 1}/20")
-        await page.wait_for_timeout(3000)
-    return None
-
-
-async def run():
-    if not COOKIES_JSON:
-        raise RuntimeError("未配置 COOKIES_JSON")
-    if not proxy_port_ok(PROXY_URL):
-        raise RuntimeError(f"代理端口未监听: {PROXY_URL}")
-    cookies = normalize_cookies(COOKIES_JSON)
-
-    print("==========================================")
-    print("开始访问 Rustix 控制台 (Mitelis 防火墙伪装模式)")
-    print(f"代理: {PROXY_URL}")
-    print("==========================================")
+async def run_playwright_official_chrome(playwright_cookies):
+    """【突破方案二】：使用官方正版 Chrome 替代 Chromium，绕过 Playwright TLS 特征拦截"""
+    print("\n🌐 [方案二] 启动官方 Google Chrome 浏览器 (channel='chrome')...")
 
     async with async_playwright() as p:
-        # 💡 关键点 1: headless=False (配合 Xvfb 实现真实界面运行，规避无头检测)
-        # 💡 关键点 2: ignore_default_args 屏蔽自动化标识
+        # 使用 channel="chrome" 调用真正安装的 Google Chrome 浏览器
         browser = await p.chromium.launch(
+            channel="chrome",
             headless=False,
             ignore_default_args=["--enable-automation"],
             proxy={"server": PROXY_URL},
@@ -261,78 +208,66 @@ async def run():
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-quic",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
-                "--window-size=1366,768",
             ],
         )
 
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             user_agent=USER_AGENT,
-            locale="ru-RU",
-            extra_http_headers={
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-            }
+            locale="ru-RU"
         )
 
-        # 💡 关键点 3: 注入防护层伪装逻辑
-        await inject_stealth(context)
-        await context.add_cookies(cookies)
+        # 隐藏 webdriver 特征
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+        await context.add_cookies(playwright_cookies)
         page = await context.new_page()
 
+        print(f"🌐 打开页面: {CONSOLE_URL}")
         response = await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
-        
-        # 模拟真人鼠标微动，协助通过隐式 JavaScript 验证
-        await page.mouse.move(100, 100)
+        await page.mouse.move(50, 50)
         await page.wait_for_timeout(8000)
 
         body = await page.locator("body").inner_text(timeout=10000)
-        combined = f"{page.url}\n{body}"
-
-        for marker in NETWORK_MARKERS:
-            if marker.lower() in combined.lower():
-                await save_diagnostics(page, "network_error")
-                raise RuntimeError(f"页面网络错误: {marker}")
-
-        if response and response.status >= 400:
-            await save_diagnostics(page, "http_error")
-            raise RuntimeError(f"Rustix 返回 HTTP {response.status}")
-
         if "access denied" in body.lower():
-            # 尝试等待 10 秒看 Mitelis 的 JavaScript 挑战是否自动通过
-            print("⚠️ 检测到 Access denied，等待 Mitelis 自动验证跳转...")
-            await page.wait_for_timeout(10000)
-            body = await page.locator("body").inner_text(timeout=5000)
-            if "access denied" in body.lower():
-                await save_diagnostics(page, "access_denied")
-                raise RuntimeError("Rustix/Mitelis 返回 Access denied (伪装未能绕过防护)")
+            await page.screenshot(path="access_denied.png", full_page=True)
+            raise RuntimeError("Mitelis 防火墙在浏览器层依然拒绝访问，请重新从代理节点下导出最新 COOKIES_JSON！")
 
-        if "login" in page.url.lower() or "auth" in page.url.lower():
-            await save_diagnostics(page, "login_failed")
-            raise RuntimeError("Cookie 已失效，已跳转登录页")
+        print("✅ 防火墙通过！找到控制台面板，开始寻找按钮...")
+        for attempt in range(20):
+            for frame in page.frames:
+                res = await click_in_frame(frame)
+                if res:
+                    action, label, frame_url = res
+                    print(f"🎉 成功点击按钮: {label} ({action})")
+                    await page.wait_for_timeout(5000)
+                    await page.screenshot(path="after_click.png", full_page=True)
+                    notify(f"服务器控制指令已成功发出：{label}（{action}）")
+                    await browser.close()
+                    return
+            await page.wait_for_timeout(3000)
 
-        print("✅ 防火墙通过，进入面板，开始匹配按钮...")
-        result = await find_and_click(page)
-        if not result:
-            await save_diagnostics(page, "button_not_found")
-            raise RuntimeError("控制台已打开，但 60 秒内在主页面、iframe 和 Shadow DOM 中均未找到可用的 Рестарт/Старт 按钮")
-
-        action, label, frame_url = result
-        print(f"成功点击: {label}；frame={frame_url}")
-        await page.wait_for_timeout(8000)
-        await page.screenshot(path="after_click.png", full_page=True)
-        notify(f"服务器控制指令已发出：{label}（{action}）")
-        await browser.close()
+        await page.screenshot(path="button_not_found.png", full_page=True)
+        raise RuntimeError("控制台未能在 60 秒内渲染出可用按钮")
 
 
 async def main():
+    if not COOKIES_JSON:
+        raise RuntimeError("未配置 COOKIES_JSON")
+    if not proxy_port_ok(PROXY_URL):
+        raise RuntimeError(f"代理端口未监听: {PROXY_URL}")
+
+    cookie_dict, xsrf_token, playwright_cookies = parse_cookie_dict(COOKIES_JSON)
+
+    # 1. 优先尝试 TLS 指纹伪装直连 API
+    if try_cffi_bypass(cookie_dict, xsrf_token):
+        sys.exit(0)
+
+    # 2. 回退使用正版 Google Chrome 模拟
+    print("⚠️ API 直连未突破，降级使用官方正版 Google Chrome 进行图形界面交互...")
     try:
-        await run()
+        await run_playwright_official_chrome(playwright_cookies)
     except Exception as exc:
         print(f"脚本运行出错: {exc}")
         notify(f"脚本运行失败\n\n{exc}")
