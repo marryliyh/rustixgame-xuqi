@@ -56,12 +56,14 @@ jobs:
             -fsS https://api.ipify.org | tee node_exit_ip.txt
           echo
 
-      - name: Install Playwright Chromium and Xvfb
+      - name: Install Dependencies, Google Chrome, and Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install playwright requests
-          playwright install --with-deps chromium
+          pip install playwright requests curl_cffi
+          # 💡 安装官方正版 Google Chrome 以突破 TLS 校验
+          playwright install chrome
+          playwright install-deps
 
       - name: Run Rustix automation
         env:
@@ -75,12 +77,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rustix-node-link-${{ github.run_number }}
+          name: rustix-diagnostics-${{ github.run_number }}
           if-no-files-found: ignore
           path: |
             *.png
             *.html
-            *.txt
             singbox.log
 
       - name: Delete old workflow runs
