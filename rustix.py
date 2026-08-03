@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -21,8 +22,6 @@ COOKIES_JSON = os.getenv("COOKIES_JSON", "")
 PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 CONSOLE_URL = os.getenv("CONSOLE_URL", "https://my.rustix.me/server/226fd977/console")
 API_POWER_URL = "https://my.rustix.me/api/client/servers/226fd977/power"
-
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 BUTTONS = (
     ("start", ("Старт", "Start", "启动", "开机")),
@@ -96,6 +95,25 @@ def parse_cookie_dict(value):
     return cookie_dict, xsrf_token, playwright_cookies
 
 
+def extract_user_agent(cookie_dict):
+    """自动从 mit_ck_p1 中反向解码真实的 User-Agent，避免触发 UA Mismatch 被封禁"""
+    mit_p1 = cookie_dict.get("mit_ck_p1", "")
+    if mit_p1:
+        try:
+            decoded = base64.b64decode(mit_p1).decode('utf-8', errors='ignore')
+            parts = decoded.split('|')
+            for part in parts:
+                if part.startswith("Mozilla/5.0"):
+                    print(f"🎯 成功从 mit_ck_p1 自动匹配解密出真实 UA: {part}")
+                    return part
+        except Exception as e:
+            print(f"⚠️ 解析 Cookie 中的 UA 失败: {e}")
+            
+    default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    print(f"ℹ️ 使用默认 UA: {default_ua}")
+    return default_ua
+
+
 def test_connectivity(use_proxy=True):
     mode = f"代理 ({PROXY_URL})" if use_proxy else "直连 (GitHub Actions Native)"
     print(f"🔍 正在测试针对 my.rustix.me 的 TLS 连通性 [{mode}]...")
@@ -113,7 +131,7 @@ def test_connectivity(use_proxy=True):
         return False
 
 
-def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
+def try_cffi_bypass(cookie_dict, xsrf_token, user_agent, use_proxy=True):
     """尝试 API 直连"""
     if not HAS_CFFI:
         return False
@@ -122,7 +140,7 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
     print(f"\n⚡ 尝试 curl_cffi API 直连 ({mode})...")
     
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": user_agent,
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Origin": "https://my.rustix.me",
@@ -145,15 +163,14 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
                 cookies=cookie_dict,
                 proxies=proxies,
                 timeout=15,
-                allow_redirects=False # 💡 关键：禁止自动跟重定向，防止把 302 重定向到登录页误判为 200
+                allow_redirects=False
             )
-            # 💡 翼龙面板 API 成功必须是 204 No Content
             if res.status_code == 204:
-                print(f"🎉 API 响应真实 HTTP 204！成功发送 [{action}] 指令！")
-                notify(f"🚀 API 直连校验成功！已向服务器发送 [{action}] 开机指令！({mode})")
+                print(f"🎉 API 响应真实 HTTP 204！已向服务器发送 [{action}] 指令！")
+                notify(f"🚀 API 直连成功！已向服务器发送 [{action}] 开机指令！({mode})")
                 return True
             else:
-                print(f"ℹ️ API 响应 HTTP {res.status_code} (非 204 意味着重定向/无效)，将降级转入 Chrome 浏览器界面真实点击模式...")
+                print(f"ℹ️ API 响应 HTTP {res.status_code}，降级转入 Chrome 浏览器界面真实点击模式...")
                 return False
     except Exception as exc:
         print(f"⚠️ API 尝试异常: {exc}")
@@ -192,7 +209,7 @@ async def click_in_frame(frame):
     return None
 
 
-async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
+async def run_playwright_official_chrome(playwright_cookies, user_agent, use_proxy=True):
     """启动官方 Chrome 进行图形界面操作并截图"""
     mode = "代理模式" if use_proxy else "直连模式"
     print(f"\n🌐 启动官方 Google Chrome 浏览器 ({mode})...")
@@ -214,7 +231,7 @@ async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
             launch_kwargs["proxy"] = {"server": PROXY_URL}
 
         browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent=USER_AGENT, locale="ru-RU")
+        context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent=user_agent, locale="ru-RU")
 
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
         await context.add_cookies(playwright_cookies)
@@ -228,25 +245,21 @@ async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
         body = await page.locator("body").inner_text(timeout=10000)
         if "access denied" in body.lower():
             await page.screenshot(path="00_access_denied.png", full_page=True)
-            raise RuntimeError("Mitelis 防火墙拒绝访问，请重新导出 COOKIES_JSON！")
+            raise RuntimeError("Mitelis 防火墙拒绝访问，可能当前节点 IP 仍处于冷却期，请更换节点或重新导出 COOKIES_JSON！")
 
-        # 📸 1. 保存点击前的控制台截图
         await page.screenshot(path="01_before_click.png", full_page=True)
         print("📸 已生成点击前截图: 01_before_click.png")
 
-        print("✅ 成功进入页面，开始寻找并点击 Старт / Рестарт 按钮...")
+        print("✅ 成功进入页面，寻找并点击 Старт / Рестарт 按钮...")
         for attempt in range(20):
             for frame in page.frames:
                 res = await click_in_frame(frame)
                 if res:
                     action, label, frame_url = res
                     print(f"🎉 成功点击按钮: {label} ({action})！")
-                    
-                    # 💡 关键：点击开机按钮后等待 10 秒，让面板加载出开机状态
                     print("⏳ 等待 10 秒以捕捉服务器最新的启动状态...")
                     await page.wait_for_timeout(10000)
                     
-                    # 📸 2. 保存点击 10 秒后的状态截图
                     await page.screenshot(path="02_after_click_status.png", full_page=True)
                     print("📸 已生成启动后状态截图: 02_after_click_status.png")
 
@@ -264,6 +277,7 @@ async def main():
         raise RuntimeError("未配置 COOKIES_JSON")
 
     cookie_dict, xsrf_token, playwright_cookies = parse_cookie_dict(COOKIES_JSON)
+    user_agent = extract_user_agent(cookie_dict)
 
     use_proxy = False
     if test_connectivity(use_proxy=True):
@@ -274,13 +288,11 @@ async def main():
     else:
         raise RuntimeError("代理通道与直连通道均无法连接 my.rustix.me")
 
-    # 1. 尝试真实 204 API 直连
-    if try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=use_proxy):
+    if try_cffi_bypass(cookie_dict, xsrf_token, user_agent, use_proxy=use_proxy):
         sys.exit(0)
 
-    # 2. API 未拿到 204，降级走真实 Chrome 图形界面点击并截图
     try:
-        await run_playwright_official_chrome(playwright_cookies, use_proxy=use_proxy)
+        await run_playwright_official_chrome(playwright_cookies, user_agent, use_proxy=use_proxy)
     except Exception as exc:
         print(f"脚本运行出错: {exc}")
         notify(f"脚本运行失败\n\n{exc}")
