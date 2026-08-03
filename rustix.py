@@ -1,11 +1,11 @@
 import os
 import sys
 import time
-import requests
+from curl_cffi import requests
 
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-API_KEY = os.getenv("API_KEY", "")
+API_KEY = os.getenv("API_KEY", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 
 SERVER_ID = "226fd977"
@@ -32,13 +32,6 @@ def notify(text):
     except Exception as exc:
         print(f"[TG] 通知异常: {exc}")
 
-def get_session():
-    session = requests.Session()
-    session.headers.update(headers)
-    if PROXY_URL:
-        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-    return session
-
 def get_server_status(session):
     """获取服务器当前实时状态"""
     try:
@@ -49,6 +42,7 @@ def get_server_status(session):
             return state
         else:
             print(f"⚠️ 获取服务器状态失败: HTTP {res.status_code}")
+            print(f"📄 响应内容示例: {res.text[:300]}")
             return "unknown"
     except Exception as e:
         print(f"⚠️ 查询状态异常: {e}")
@@ -58,20 +52,27 @@ def send_power_signal(session, signal):
     """发送电源指令 (start / restart)"""
     url = f"{BASE_URL}/power"
     res = session.post(url, json={"signal": signal}, timeout=15)
-    return res.status_code == 204
+    if res.status_code == 204:
+        return True
+    else:
+        print(f"⚠️ 发送指令返回 HTTP {res.status_code}: {res.text[:300]}")
+        return False
 
 def main():
     if not API_KEY:
         print("❌ 错误：未配置 API_KEY Secrets！")
         sys.exit(1)
 
-    session = get_session()
+    # 实例化 curl_cffi 会话，模拟 Chrome 124 TLS 指纹
+    session = requests.Session(impersonate="chrome124")
+    session.headers.update(headers)
+    if PROXY_URL:
+        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
     
     print("🔍 正在检查服务器当前运行状态...")
     initial_state = get_server_status(session)
     print(f"📊 当前服务器状态: [{initial_state}]")
 
-    # 如果服务器已经处于运行中 (running)，则执行重启 (restart) 进行保活；如果是关机 (offline)，则执行开机 (start)
     target_signal = "restart" if initial_state == "running" else "start"
     
     print(f"⚡ 正在通过官方 Client API 发送 [{target_signal}] 指令...")
