@@ -59,56 +59,46 @@ async def main():
         )
         page = await context.new_page()
 
-        # 1. 访问主页，让浏览器自动跑完 Mitelis JS 防火墙验证
+        # 1. 打开主页，让真实 Chrome 跑完 Mitelis JS 验证并获得 Cookie
         print("⏳ 正在通过 Mitelis JS 防火墙...")
         await page.goto("https://my.rustix.me", wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # 2. 在浏览器上下文中直接用 API Key 查询服务器状态
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        # 2. 使用 context.request 发起请求（继承浏览器 WAF Cookie，且不触发 OPTIONS 预检）
         print("🔍 正在获取服务器当前状态...")
-        status_res = await page.evaluate(
-            """async ({ url, key }) => {
-                const res = await fetch(url, {
-                    headers: {
-                        'Authorization': 'Bearer ' + key,
-                        'Accept': 'application/json'
-                    }
-                });
-                if (res.status === 200) {
-                    const data = await res.json();
-                    return data.attributes ? data.attributes.current_state : 'unknown';
-                }
-                return 'error_' + res.status;
-            }""",
-            {"url": API_STATUS_URL, "key": API_KEY},
-        )
+        status_res_obj = await context.request.get(API_STATUS_URL, headers=headers)
+        
+        status_res = "unknown"
+        if status_res_obj.status == 200:
+            data = await status_res_obj.json()
+            status_res = data.get("attributes", {}).get("current_state", "unknown")
+        else:
+            print(f"⚠️ 查询状态返回 HTTP {status_res_obj.status}")
 
         print(f"📊 服务器当前状态: [{status_res}]")
 
         target_signal = "restart" if status_res == "running" else "start"
         print(f"⚡ 通过 API 发送 [{target_signal}] 指令...")
 
-        # 3. 在通过防火墙的浏览器内部发送 Power 信号
-        power_res = await page.evaluate(
-            """async ({ url, key, signal }) => {
-                const res = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': 'Bearer ' + key,
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json'
-                    },
-                    body: JSON.stringify({ signal: signal })
-                });
-                return res.status;
-            }""",
-            {"url": API_POWER_URL, "key": API_KEY, "signal": target_signal},
+        # 3. 发送电源指令
+        power_res_obj = await context.request.post(
+            API_POWER_URL,
+            headers=headers,
+            data={"signal": target_signal},
         )
 
-        if power_res == 204:
+        power_status = power_res_obj.status
+
+        if power_status == 204:
             print(f"🎉 成功发送 [{target_signal}] 开机/重启指令！")
             
-            # 4. 跳转到控制台页面并留存 10 秒后的真实状态截图
+            # 4. 跳转控制台页面，等待 10 秒后拍摄实时截图
             print("🌐 正在跳转控制台页面并拍摄实时状态截图...")
             await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(10000)
@@ -120,9 +110,11 @@ async def main():
             await browser.close()
             sys.exit(0)
         else:
-            print(f"❌ 发送指令失败，API 返回 HTTP {power_res}")
+            print(f"❌ 发送指令失败，API 返回 HTTP {power_status}")
+            body_text = await power_res_obj.text()
+            print(f"📄 响应内容: {body_text[:300]}")
             await page.screenshot(path="error_api_failed.png", full_page=True)
-            notify(f"❌ 保活失败：API 响应错误 HTTP {power_res}")
+            notify(f"❌ 保活失败：API 响应错误 HTTP {power_status}")
             await browser.close()
             sys.exit(1)
 
