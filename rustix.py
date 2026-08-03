@@ -7,7 +7,6 @@ import sys
 from urllib.parse import urlparse, unquote
 import requests
 
-# 导入 curl_cffi 用于绕过 Mitelis TLS 指纹检测
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CFFI = True
@@ -25,12 +24,6 @@ API_POWER_URL = "https://my.rustix.me/api/client/servers/226fd977/power"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-NETWORK_MARKERS = (
-    "ERR_SSL_PROTOCOL_ERROR", "ERR_PROXY_CONNECTION_FAILED",
-    "ERR_TUNNEL_CONNECTION_FAILED", "ERR_CONNECTION_RESET",
-    "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_TIMED_OUT",
-    "ERR_NAME_NOT_RESOLVED", "chrome-error://chromewebdata",
-)
 BUTTONS = (
     ("restart", ("Рестарт", "Restart", "Reboot", "重启")),
     ("start", ("Старт", "Start", "启动", "开机")),
@@ -50,15 +43,6 @@ def notify(text):
         print("[TG] 通知发送成功" if r.ok else f"[TG] 通知失败: HTTP {r.status_code}")
     except Exception as exc:
         print(f"[TG] 通知异常: {exc}")
-
-
-def proxy_port_ok(url):
-    parsed = urlparse(url)
-    try:
-        with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 10808), timeout=3):
-            return True
-    except OSError:
-        return False
 
 
 def parse_cookie_dict(value):
@@ -112,13 +96,31 @@ def parse_cookie_dict(value):
     return cookie_dict, xsrf_token, playwright_cookies
 
 
-def try_cffi_bypass(cookie_dict, xsrf_token):
-    """【突破方案一】：利用 curl_cffi 伪造 100% 真实 Chrome TLS 握手，穿透 Mitelis 防火墙直连 API"""
-    if not HAS_CFFI:
-        print("⚠️ 未安装 curl_cffi，跳过 TLS 绕过模式")
+def test_connectivity(use_proxy=True):
+    """测试网络连通性，防止网络层直接断开"""
+    mode = f"代理 ({PROXY_URL})" if use_proxy else "直连 (GitHub Actions Native)"
+    print(f"🔍 正在测试针对 my.rustix.me 的 TLS 连通性 [{mode}]...")
+    
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if use_proxy else None
+    try:
+        if HAS_CFFI:
+            r = cffi_requests.get("https://my.rustix.me", proxies=proxies, impersonate="chrome124", timeout=10)
+        else:
+            r = requests.get("https://my.rustix.me", proxies=proxies, timeout=10)
+        print(f"✅ 连通性测试通过！Status: {r.status_code}")
+        return True
+    except Exception as e:
+        print(f"❌ 连通失败 ({mode}): {e}")
         return False
 
-    print("\n⚡ [方案一] 正在使用 curl_cffi 进行 Chrome TLS 指纹伪装直连...")
+
+def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
+    """尝试 API 直连"""
+    if not HAS_CFFI:
+        return False
+
+    mode = "代理模式" if use_proxy else "直连模式"
+    print(f"\n⚡ 尝试 curl_cffi API 直连 ({mode})...")
     
     headers = {
         "User-Agent": USER_AGENT,
@@ -131,33 +133,27 @@ def try_cffi_bypass(cookie_dict, xsrf_token):
     if xsrf_token:
         headers["X-XSRF-TOKEN"] = xsrf_token
 
-    try:
-        # 使用 impersonate="chrome124" 模仿真实 Chrome TLS 握手
-        session = cffi_requests.Session(impersonate="chrome124")
-        
-        # 预热请求获取并更新动态 Mitelis 凭证
-        warmup = session.get(CONSOLE_URL, headers=headers, cookies=cookie_dict, proxies={"https": PROXY_URL, "http": PROXY_URL}, timeout=15)
-        if "access denied" in warmup.text.lower():
-            print("⚠️ TLS 直连获取控制台依旧受阻，尝试直接发送 Power 指令...")
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if use_proxy else None
 
+    try:
+        session = cffi_requests.Session(impersonate="chrome124")
         for action in ["restart", "start"]:
             res = session.post(
                 API_POWER_URL,
                 json={"signal": action},
                 headers=headers,
                 cookies=cookie_dict,
-                proxies={"https": PROXY_URL, "http": PROXY_URL},
+                proxies=proxies,
                 timeout=15
             )
             if res.status_code in (200, 204):
-                print(f"🎉 [Mitelis 突破成功] API 响应成功 (Status {res.status_code})！已发送 [{action}] 指令！")
-                notify(f"🚀 Mitelis 防火墙成功绕过！\n已通过 API 直连向服务器发送 [{action}] 成功！")
+                print(f"🎉 API 响应成功 (Status {res.status_code})！已发送 [{action}] 指令！")
+                notify(f"🚀 向服务器发送 [{action}] 成功！({mode})")
                 return True
             else:
                 print(f"ℹ️ API 响应 Status {res.status_code}: {res.text[:120]}")
-
     except Exception as exc:
-        print(f"⚠️ curl_cffi 尝试过程出现异常: {exc}")
+        print(f"⚠️ API 尝试失败: {exc}")
 
     return False
 
@@ -193,48 +189,45 @@ async def click_in_frame(frame):
     return None
 
 
-async def run_playwright_official_chrome(playwright_cookies):
-    """【突破方案二】：使用官方正版 Chrome 替代 Chromium，绕过 Playwright TLS 特征拦截"""
-    print("\n🌐 [方案二] 启动官方 Google Chrome 浏览器 (channel='chrome')...")
+async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
+    """启动官方 Chrome 进行图形界面操作"""
+    mode = "代理模式" if use_proxy else "直连模式"
+    print(f"\n🌐 启动官方 Google Chrome 浏览器 ({mode})...")
 
     async with async_playwright() as p:
-        # 使用 channel="chrome" 调用真正安装的 Google Chrome 浏览器
-        browser = await p.chromium.launch(
-            channel="chrome",
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-            proxy={"server": PROXY_URL},
-            args=[
+        launch_kwargs = {
+            "channel": "chrome",
+            "headless": False,
+            "ignore_default_args": ["--enable-automation"],
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
             ],
-        )
+        }
+        if use_proxy:
+            launch_kwargs["proxy"] = {"server": PROXY_URL}
 
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=USER_AGENT,
-            locale="ru-RU"
-        )
+        browser = await p.chromium.launch(**launch_kwargs)
+        context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent=USER_AGENT, locale="ru-RU")
 
-        # 隐藏 webdriver 特征
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
         await context.add_cookies(playwright_cookies)
         page = await context.new_page()
 
         print(f"🌐 打开页面: {CONSOLE_URL}")
-        response = await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
         await page.mouse.move(50, 50)
         await page.wait_for_timeout(8000)
 
         body = await page.locator("body").inner_text(timeout=10000)
         if "access denied" in body.lower():
             await page.screenshot(path="access_denied.png", full_page=True)
-            raise RuntimeError("Mitelis 防火墙在浏览器层依然拒绝访问，请重新从代理节点下导出最新 COOKIES_JSON！")
+            raise RuntimeError("Mitelis 防火墙拒绝访问，请更新 COOKIES_JSON！")
 
-        print("✅ 防火墙通过！找到控制台面板，开始寻找按钮...")
+        print("✅ 成功加载控制台，开始寻找重启/启动按钮...")
         for attempt in range(20):
             for frame in page.frames:
                 res = await click_in_frame(frame)
@@ -249,25 +242,32 @@ async def run_playwright_official_chrome(playwright_cookies):
             await page.wait_for_timeout(3000)
 
         await page.screenshot(path="button_not_found.png", full_page=True)
-        raise RuntimeError("控制台未能在 60 秒内渲染出可用按钮")
+        raise RuntimeError("未找到可用按钮")
 
 
 async def main():
     if not COOKIES_JSON:
         raise RuntimeError("未配置 COOKIES_JSON")
-    if not proxy_port_ok(PROXY_URL):
-        raise RuntimeError(f"代理端口未监听: {PROXY_URL}")
 
     cookie_dict, xsrf_token, playwright_cookies = parse_cookie_dict(COOKIES_JSON)
 
-    # 1. 优先尝试 TLS 指纹伪装直连 API
-    if try_cffi_bypass(cookie_dict, xsrf_token):
+    # 1. 优先评估代理通道
+    use_proxy = False
+    if test_connectivity(use_proxy=True):
+        use_proxy = True
+    elif test_connectivity(use_proxy=False):
+        print("⚠️ 代理节点 IP 被 Rustix/Mitelis 拒绝 (ERR_CONNECTION_CLOSED)，将自动切为【直连模式】！")
+        use_proxy = False
+    else:
+        raise RuntimeError("代理通道和直连通道均无法连接至 my.rustix.me")
+
+    # 2. 尝试 API 发送
+    if try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=use_proxy):
         sys.exit(0)
 
-    # 2. 回退使用正版 Google Chrome 模拟
-    print("⚠️ API 直连未突破，降级使用官方正版 Google Chrome 进行图形界面交互...")
+    # 3. 降级使用 Chrome 浏览器
     try:
-        await run_playwright_official_chrome(playwright_cookies)
+        await run_playwright_official_chrome(playwright_cookies, use_proxy=use_proxy)
     except Exception as exc:
         print(f"脚本运行出错: {exc}")
         notify(f"脚本运行失败\n\n{exc}")
