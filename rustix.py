@@ -137,7 +137,6 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
     try:
         session = cffi_requests.Session(impersonate="chrome124")
         
-        # 💡 优先发送 start (开机) 指令拉起处于 Отключён 状态的服务器！
         for action in ["start", "restart"]:
             res = session.post(
                 API_POWER_URL,
@@ -145,16 +144,19 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
                 headers=headers,
                 cookies=cookie_dict,
                 proxies=proxies,
-                timeout=15
+                timeout=15,
+                allow_redirects=False # 💡 关键：禁止自动跟重定向，防止把 302 重定向到登录页误判为 200
             )
-            if res.status_code in (200, 204):
-                print(f"🎉 API 响应成功 (Status {res.status_code})！已发送 [{action}] 指令！")
-                notify(f"🚀 向服务器发送 [{action}] (开机/重启) 指令成功！({mode})")
+            # 💡 翼龙面板 API 成功必须是 204 No Content
+            if res.status_code == 204:
+                print(f"🎉 API 响应真实 HTTP 204！成功发送 [{action}] 指令！")
+                notify(f"🚀 API 直连校验成功！已向服务器发送 [{action}] 开机指令！({mode})")
                 return True
             else:
-                print(f"ℹ️ API 发送 [{action}] 响应 Status {res.status_code}: {res.text[:120]}")
+                print(f"ℹ️ API 响应 HTTP {res.status_code} (非 204 意味着重定向/无效)，将降级转入 Chrome 浏览器界面真实点击模式...")
+                return False
     except Exception as exc:
-        print(f"⚠️ API 尝试失败: {exc}")
+        print(f"⚠️ API 尝试异常: {exc}")
 
     return False
 
@@ -191,7 +193,7 @@ async def click_in_frame(frame):
 
 
 async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
-    """启动官方 Chrome 进行图形界面操作"""
+    """启动官方 Chrome 进行图形界面操作并截图"""
     mode = "代理模式" if use_proxy else "直连模式"
     print(f"\n🌐 启动官方 Google Chrome 浏览器 ({mode})...")
 
@@ -218,32 +220,43 @@ async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
         await context.add_cookies(playwright_cookies)
         page = await context.new_page()
 
-        print(f"🌐 打开页面: {CONSOLE_URL}")
+        print(f"🌐 打开控制台页面: {CONSOLE_URL}")
         await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
         await page.mouse.move(50, 50)
         await page.wait_for_timeout(8000)
 
         body = await page.locator("body").inner_text(timeout=10000)
         if "access denied" in body.lower():
-            await page.screenshot(path="access_denied.png", full_page=True)
-            raise RuntimeError("Mitelis 防火墙拒绝访问，请更新 COOKIES_JSON！")
+            await page.screenshot(path="00_access_denied.png", full_page=True)
+            raise RuntimeError("Mitelis 防火墙拒绝访问，请重新导出 COOKIES_JSON！")
 
-        print("✅ 成功加载控制台，开始寻找 Старт/Рестарт 按钮...")
+        # 📸 1. 保存点击前的控制台截图
+        await page.screenshot(path="01_before_click.png", full_page=True)
+        print("📸 已生成点击前截图: 01_before_click.png")
+
+        print("✅ 成功进入页面，开始寻找并点击 Старт / Рестарт 按钮...")
         for attempt in range(20):
             for frame in page.frames:
                 res = await click_in_frame(frame)
                 if res:
                     action, label, frame_url = res
-                    print(f"🎉 成功点击按钮: {label} ({action})")
-                    await page.wait_for_timeout(5000)
-                    await page.screenshot(path="after_click.png", full_page=True)
-                    notify(f"服务器控制指令已成功发出：{label}（{action}）")
+                    print(f"🎉 成功点击按钮: {label} ({action})！")
+                    
+                    # 💡 关键：点击开机按钮后等待 10 秒，让面板加载出开机状态
+                    print("⏳ 等待 10 秒以捕捉服务器最新的启动状态...")
+                    await page.wait_for_timeout(10000)
+                    
+                    # 📸 2. 保存点击 10 秒后的状态截图
+                    await page.screenshot(path="02_after_click_status.png", full_page=True)
+                    print("📸 已生成启动后状态截图: 02_after_click_status.png")
+
+                    notify(f"服务器控制指令已发：[{label}]。状态截图已存入 Actions Artifacts！")
                     await browser.close()
                     return
             await page.wait_for_timeout(3000)
 
-        await page.screenshot(path="button_not_found.png", full_page=True)
-        raise RuntimeError("未找到可用按钮")
+        await page.screenshot(path="error_button_not_found.png", full_page=True)
+        raise RuntimeError("在控制台未找到可用按钮")
 
 
 async def main():
@@ -256,14 +269,16 @@ async def main():
     if test_connectivity(use_proxy=True):
         use_proxy = True
     elif test_connectivity(use_proxy=False):
-        print("⚠️ 代理节点 IP 被 Rustix/Mitelis 拒绝，将自动切为【直连模式】！")
+        print("⚠️ 代理节点 IP 被 Rustix 拒绝，自动切为【直连模式】！")
         use_proxy = False
     else:
-        raise RuntimeError("代理通道和直连通道均无法连接至 my.rustix.me")
+        raise RuntimeError("代理通道与直连通道均无法连接 my.rustix.me")
 
+    # 1. 尝试真实 204 API 直连
     if try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=use_proxy):
         sys.exit(0)
 
+    # 2. API 未拿到 204，降级走真实 Chrome 图形界面点击并截图
     try:
         await run_playwright_official_chrome(playwright_cookies, use_proxy=use_proxy)
     except Exception as exc:
