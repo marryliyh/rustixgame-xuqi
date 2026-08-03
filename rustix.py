@@ -13,7 +13,6 @@ PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 SERVER_ID = "226fd977"
 CONSOLE_URL = f"https://my.rustix.me/server/{SERVER_ID}/console"
 API_POWER_URL = f"https://my.rustix.me/api/client/servers/{SERVER_ID}/power"
-API_STATUS_URL = f"https://my.rustix.me/api/client/servers/{SERVER_ID}/resources"
 
 
 def notify(text):
@@ -32,10 +31,6 @@ def notify(text):
 
 
 async def main():
-    if not API_KEY:
-        print("❌ 错误：未配置 API_KEY！")
-        sys.exit(1)
-
     print("🌐 启动 Google Chrome 浏览器并加载防护屏障...")
 
     async with async_playwright() as p:
@@ -59,74 +54,79 @@ async def main():
         )
         page = await context.new_page()
 
-        # 1. 打开主页（改成 domcontentloaded，绝不卡死等待 networkidle）
-        print("⏳ 正在通过 Mitelis JS 防火墙...")
+        print(f"⏳ 正在打开服务器控制台页面: {CONSOLE_URL}")
         try:
-            await page.goto("https://my.rustix.me", wait_until="domcontentloaded", timeout=60000)
+            await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"⚠️ 第一次连接被断开 ({e})，自动进行第二次重试...")
+            print(f"⚠️ 首次加载提示 ({e})，等待 3 秒后重试...")
             await page.wait_for_timeout(3000)
-            await page.goto("https://my.rustix.me", wait_until="domcontentloaded", timeout=60000)
+            await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 强制等待 6 秒让 Mitelis 防火墙完成 JS 验证并注入 Cookie
-        await page.wait_for_timeout(6000)
+        # 留出足够的 8 秒时间给 Mitelis 盾解密并渲染翼龙面板
+        print("⏳ 等待 8 秒让 Mitelis 完成 JS 验证与页面渲染...")
+        await page.wait_for_timeout(8000)
 
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
+        # 检查是否被 WAF 硬封禁
+        body_text = await page.locator("body").inner_text()
+        if "access denied" in body_text.lower():
+            await page.screenshot(path="00_access_denied.png", full_page=True)
+            raise RuntimeError("Mitelis 防火墙拒绝访问，可能当前节点 IP 仍处于冷却期，请尝试更换节点！")
 
-        # 2. 查询服务器当前状态
-        print("🔍 正在获取服务器当前状态...")
-        status_res = "unknown"
-        try:
-            status_res_obj = await context.request.get(API_STATUS_URL, headers=headers)
-            if status_res_obj.status == 200:
-                data = await status_res_obj.json()
-                status_res = data.get("attributes", {}).get("current_state", "unknown")
-            else:
-                print(f"⚠️ 查询状态返回 HTTP {status_res_obj.status}")
-        except Exception as e:
-            print(f"⚠️ 查询状态异常: {e}")
+        print("🔍 尝试通过 Chrome 界面按钮点击 [Start / Restart]...")
+        clicked = False
 
-        print(f"📊 服务器当前状态: [{status_res}]")
+        # 寻找控制台 UI 上的开机/重启按钮
+        selectors = [
+            "button:has-text('Start')", "button:has-text('Restart')",
+            "button:has-text('Старт')", "button:has-text('Рестарт')",
+            "button:has-text('启动')", "button:has-text('重启')"
+        ]
 
-        target_signal = "restart" if status_res == "running" else "start"
-        print(f"⚡ 通过 API 发送 [{target_signal}] 指令...")
+        for selector in selectors:
+            btn = page.locator(selector).first
+            if await btn.is_visible():
+                btn_text = await btn.inner_text()
+                print(f"🎉 成功找到 UI 按钮 [{btn_text.strip()}]，准备点击...")
+                await btn.click(force=True)
+                clicked = True
+                break
 
-        # 3. 发送电源指令
-        power_res_obj = await context.request.post(
-            API_POWER_URL,
-            headers=headers,
-            data={"signal": target_signal},
-        )
+        # 如果界面按钮未找到，在同源 Chrome 页面上下文内部发起 API 触发
+        if not clicked:
+            print("ℹ️ UI 按钮暂未捕捉到，在同源 Chrome 内部发送电源指令...")
+            api_result = await page.evaluate(
+                """async ({ url, key }) => {
+                    try {
+                        const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+                        if (key) headers['Authorization'] = 'Bearer ' + key;
+                        const res = await fetch(url, {
+                            method: 'POST',
+                            headers: headers,
+                            body: JSON.stringify({ signal: 'start' })
+                        });
+                        return res.status;
+                    } catch (e) {
+                        return 'err:' + e.message;
+                    }
+                }""",
+                {"url": API_POWER_URL, "key": API_KEY},
+            )
+            print(f"⚡ 页面内同源 API 请求响应码: {api_result}")
+            if api_result == 204 or api_result == 200:
+                clicked = True
 
-        power_status = power_res_obj.status
+        print("⏳ 等待 10 秒以捕获服务器最新运行状态...")
+        await page.wait_for_timeout(10000)
 
-        if power_status == 204:
-            print(f"🎉 成功发送 [{target_signal}] 开机/重启指令！")
+        await page.screenshot(path="02_after_click_status.png", full_page=True)
+        print("📸 状态截图已保存: 02_after_click_status.png")
 
-            # 4. 跳转控制台页面，等待 10 秒后拍摄实时状态截图
-            print("🌐 正在跳转控制台页面并拍摄实时状态截图...")
-            try:
-                await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(10000)
-
-            await page.screenshot(path="02_after_click_status.png", full_page=True)
-            print("📸 状态截图已保存: 02_after_click_status.png")
-
-            notify(f"🚀 API 指令 [{target_signal}] 发送成功！服务器状态截图已打包存入 Actions Artifacts。")
+        if clicked:
+            notify("🚀 Rustix 保活成功！开机/重启指令已成功发送，实时截图已存入 Actions Artifacts。")
             await browser.close()
             sys.exit(0)
         else:
-            print(f"❌ 发送指令失败，API 返回 HTTP {power_status}")
-            body_text = await power_res_obj.text()
-            print(f"📄 响应内容: {body_text[:300]}")
-            await page.screenshot(path="error_api_failed.png", full_page=True)
-            notify(f"❌ 保活失败：API 响应错误 HTTP {power_status}")
+            notify("❌ 没能成功点击或触发开机指令，请查看 Artifacts 截图。")
             await browser.close()
             sys.exit(1)
 
