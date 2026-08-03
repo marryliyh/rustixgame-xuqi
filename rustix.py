@@ -59,10 +59,17 @@ async def main():
         )
         page = await context.new_page()
 
-        # 1. 打开主页，让真实 Chrome 跑完 Mitelis JS 验证并获得 Cookie
+        # 1. 打开主页（改成 domcontentloaded，绝不卡死等待 networkidle）
         print("⏳ 正在通过 Mitelis JS 防火墙...")
-        await page.goto("https://my.rustix.me", wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(5000)
+        try:
+            await page.goto("https://my.rustix.me", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"⚠️ 第一次连接被断开 ({e})，自动进行第二次重试...")
+            await page.wait_for_timeout(3000)
+            await page.goto("https://my.rustix.me", wait_until="domcontentloaded", timeout=60000)
+
+        # 强制等待 6 秒让 Mitelis 防火墙完成 JS 验证并注入 Cookie
+        await page.wait_for_timeout(6000)
 
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -70,16 +77,18 @@ async def main():
             "Content-Type": "application/json",
         }
 
-        # 2. 使用 context.request 发起请求（继承浏览器 WAF Cookie，且不触发 OPTIONS 预检）
+        # 2. 查询服务器当前状态
         print("🔍 正在获取服务器当前状态...")
-        status_res_obj = await context.request.get(API_STATUS_URL, headers=headers)
-        
         status_res = "unknown"
-        if status_res_obj.status == 200:
-            data = await status_res_obj.json()
-            status_res = data.get("attributes", {}).get("current_state", "unknown")
-        else:
-            print(f"⚠️ 查询状态返回 HTTP {status_res_obj.status}")
+        try:
+            status_res_obj = await context.request.get(API_STATUS_URL, headers=headers)
+            if status_res_obj.status == 200:
+                data = await status_res_obj.json()
+                status_res = data.get("attributes", {}).get("current_state", "unknown")
+            else:
+                print(f"⚠️ 查询状态返回 HTTP {status_res_obj.status}")
+        except Exception as e:
+            print(f"⚠️ 查询状态异常: {e}")
 
         print(f"📊 服务器当前状态: [{status_res}]")
 
@@ -97,12 +106,15 @@ async def main():
 
         if power_status == 204:
             print(f"🎉 成功发送 [{target_signal}] 开机/重启指令！")
-            
-            # 4. 跳转控制台页面，等待 10 秒后拍摄实时截图
+
+            # 4. 跳转控制台页面，等待 10 秒后拍摄实时状态截图
             print("🌐 正在跳转控制台页面并拍摄实时状态截图...")
-            await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
             await page.wait_for_timeout(10000)
-            
+
             await page.screenshot(path="02_after_click_status.png", full_page=True)
             print("📸 状态截图已保存: 02_after_click_status.png")
 
