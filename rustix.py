@@ -25,8 +25,8 @@ API_POWER_URL = "https://my.rustix.me/api/client/servers/226fd977/power"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 BUTTONS = (
-    ("restart", ("Рестарт", "Restart", "Reboot", "重启")),
     ("start", ("Старт", "Start", "启动", "开机")),
+    ("restart", ("Рестарт", "Restart", "Reboot", "重启")),
 )
 
 
@@ -97,7 +97,6 @@ def parse_cookie_dict(value):
 
 
 def test_connectivity(use_proxy=True):
-    """测试网络连通性，防止网络层直接断开"""
     mode = f"代理 ({PROXY_URL})" if use_proxy else "直连 (GitHub Actions Native)"
     print(f"🔍 正在测试针对 my.rustix.me 的 TLS 连通性 [{mode}]...")
     
@@ -137,7 +136,9 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
 
     try:
         session = cffi_requests.Session(impersonate="chrome124")
-        for action in ["restart", "start"]:
+        
+        # 💡 优先发送 start (开机) 指令拉起处于 Отключён 状态的服务器！
+        for action in ["start", "restart"]:
             res = session.post(
                 API_POWER_URL,
                 json={"signal": action},
@@ -148,10 +149,10 @@ def try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=True):
             )
             if res.status_code in (200, 204):
                 print(f"🎉 API 响应成功 (Status {res.status_code})！已发送 [{action}] 指令！")
-                notify(f"🚀 向服务器发送 [{action}] 成功！({mode})")
+                notify(f"🚀 向服务器发送 [{action}] (开机/重启) 指令成功！({mode})")
                 return True
             else:
-                print(f"ℹ️ API 响应 Status {res.status_code}: {res.text[:120]}")
+                print(f"ℹ️ API 发送 [{action}] 响应 Status {res.status_code}: {res.text[:120]}")
     except Exception as exc:
         print(f"⚠️ API 尝试失败: {exc}")
 
@@ -227,7 +228,7 @@ async def run_playwright_official_chrome(playwright_cookies, use_proxy=True):
             await page.screenshot(path="access_denied.png", full_page=True)
             raise RuntimeError("Mitelis 防火墙拒绝访问，请更新 COOKIES_JSON！")
 
-        print("✅ 成功加载控制台，开始寻找重启/启动按钮...")
+        print("✅ 成功加载控制台，开始寻找 Старт/Рестарт 按钮...")
         for attempt in range(20):
             for frame in page.frames:
                 res = await click_in_frame(frame)
@@ -251,21 +252,18 @@ async def main():
 
     cookie_dict, xsrf_token, playwright_cookies = parse_cookie_dict(COOKIES_JSON)
 
-    # 1. 优先评估代理通道
     use_proxy = False
     if test_connectivity(use_proxy=True):
         use_proxy = True
     elif test_connectivity(use_proxy=False):
-        print("⚠️ 代理节点 IP 被 Rustix/Mitelis 拒绝 (ERR_CONNECTION_CLOSED)，将自动切为【直连模式】！")
+        print("⚠️ 代理节点 IP 被 Rustix/Mitelis 拒绝，将自动切为【直连模式】！")
         use_proxy = False
     else:
         raise RuntimeError("代理通道和直连通道均无法连接至 my.rustix.me")
 
-    # 2. 尝试 API 发送
     if try_cffi_bypass(cookie_dict, xsrf_token, use_proxy=use_proxy):
         sys.exit(0)
 
-    # 3. 降级使用 Chrome 浏览器
     try:
         await run_playwright_official_chrome(playwright_cookies, use_proxy=use_proxy)
     except Exception as exc:
