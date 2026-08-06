@@ -2,7 +2,7 @@ name: Rustix Auto Restart
 
 on:
   schedule:
-    - cron: '22 */2 * * *'
+    - cron: '13 */2 * * *'
   workflow_dispatch:
 
 jobs:
