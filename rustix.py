@@ -6,7 +6,7 @@ import asyncio
 import subprocess
 
 # 1. 动态依赖检查与安装
-required_pkgs = ["curl_cffi", "requests", "websockets", "playwright"]
+required_pkgs = ["requests", "websockets", "playwright", "curl_cffi"]
 for pkg in required_pkgs:
     try:
         if pkg == "curl_cffi":
@@ -25,13 +25,6 @@ from curl_cffi import requests as cffi_requests
 import requests
 import websockets
 from playwright.async_api import async_playwright
-
-# 确保 Playwright Chromium 浏览器内核可用
-print("🌐 检查并补全 Chromium 浏览器内核...")
-try:
-    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-except Exception as e:
-    print(f"⚠️ 补全内核提示: {e}")
 
 # 2. 环境变量配置
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
@@ -54,6 +47,7 @@ os.makedirs("screenshots", exist_ok=True)
 
 
 def notify(text):
+    """发送纯文字通知到 Telegram"""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -66,41 +60,60 @@ def notify(text):
         print(f"[TG] 文字通知异常: {exc}")
 
 
-def send_tg_photo(photo_path, caption=""):
-    """发送截图到 Telegram"""
-    if not TG_TOKEN or not TG_CHAT_ID or not os.path.exists(photo_path):
-        return
+def upload_to_website(file_path):
+    """上传截图到公网图床网址，返回在线查看/下载链接"""
+    if not os.path.exists(file_path):
+        return None
     try:
-        with open(photo_path, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-                data={"chat_id": TG_CHAT_ID, "caption": f"📸 {caption}"},
-                files={"photo": f},
-                timeout=30,
+        with open(file_path, "rb") as f:
+            r = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": f},
+                timeout=20,
             )
-        print(f"📸 截图已成功发送至 Telegram: {photo_path}")
+        if r.status_code == 200 and r.text.startswith("http"):
+            url = r.text.strip()
+            print(f"🔗 截图已成功上传至网址: {url}")
+            return url
     except Exception as e:
-        print(f"[TG] 发送截图异常: {e}")
+        print(f"⚠️ 截图上传网址失败: {e}")
+    return None
 
 
 def get_server_status(headers, proxies):
+    """通过 API 查询服务器真实状态，并处理 Cloudflare 拦截"""
     try:
         r = cffi_requests.get(
             f"{BASE_URL}/resources",
             headers=headers,
             proxies=proxies,
             impersonate="chrome120",
-            timeout=12,
+            timeout=15,
         )
-        if r.status_code == 200 and r.text and r.text.strip():
-            return r.json().get("attributes", {}).get("current_state", "offline")
-    except Exception:
-        pass
-    return "offline"
+        if r.status_code == 200:
+            try:
+                res_data = r.json()
+                state = res_data.get("attributes", {}).get("current_state", "unknown")
+                print(f"  └─ API 响应成功，当前状态: [{state}]")
+                return state, "OK"
+            except Exception as e:
+                print(f"  └─ JSON 解析失败 (可能返回了非 JSON 内容): {e}")
+                return "unknown", "JSON_PARSE_ERROR"
+        elif r.status_code in [403, 503]:
+            print(f"  └─ ⚠️ 被 Cloudflare 拦截 (HTTP {r.status_code})")
+            return "unknown", f"CLOUDFLARE_BLOCKED_{r.status_code}"
+        else:
+            print(f"  └─ API 返回异常状态码: {r.status_code}")
+            return "unknown", f"HTTP_{r.status_code}"
+    except Exception as e:
+        print(f"  └─ 请求发生网络异常: {e}")
+        return "unknown", f"NETWORK_ERROR"
 
 
 async def trigger_via_websocket(headers, proxies):
-    print("🔌 方案 1: 尝试通过 WebSocket 信道发送 [set state -> start]...")
+    """通过 WebSocket 信道下发启动指令"""
+    print("🔌 尝试通过 WebSocket 信道下发启动指令...")
     try:
         ws_info_res = cffi_requests.get(
             f"{BASE_URL}/websocket",
@@ -109,8 +122,8 @@ async def trigger_via_websocket(headers, proxies):
             impersonate="chrome120",
             timeout=15,
         )
-        if ws_info_res.status_code != 200 or not ws_info_res.text.strip():
-            print(f"  └─ 获取 WS Token 失败，HTTP {ws_info_res.status_code}")
+        if ws_info_res.status_code != 200:
+            print(f"  └─ 获取 WebSocket Token 失败，HTTP 状态码: {ws_info_res.status_code}")
             return False
 
         ws_data = ws_info_res.json().get("data", {})
@@ -124,77 +137,38 @@ async def trigger_via_websocket(headers, proxies):
             await asyncio.sleep(1)
             await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
             await asyncio.sleep(2)
-            print("  └─ WebSocket 启动指令下发成功！")
+            print("  └─ WebSocket 启动指令已成功下发！")
             return True
     except Exception as e:
         print(f"  └─ WebSocket 触发跳过: {e}")
         return False
 
 
-async def trigger_via_playwright():
-    print("🌐 方案 2: 启动 Playwright 打开控制台网页进行物理点击与截图...")
+async def capture_page_screenshot():
+    """打开控制台网页进行物理渲染截图并上传"""
+    print("📸 启动 Playwright 打开控制台网页截图...")
+    proxy_config = {"server": PROXY_URL.replace("socks5h://", "socks5://")} if PROXY_URL else None
+    
     async with async_playwright() as p:
-        launch_args = [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ]
-
-        proxy_config = {"server": PROXY_URL.replace("socks5h://", "socks5://")} if PROXY_URL else None
-
-        browser = await p.chromium.launch(headless=True, args=launch_args, proxy=proxy_config)
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        )
-        page = await context.new_page()
-
         try:
-            print(f"⏳ 打开控制台: {CONSOLE_URL}")
-            await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(6000)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                proxy=proxy_config,
+            )
+            page = await browser.new_page(viewport={"width": 1366, "height": 768})
+            await page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
-            shot1 = "screenshots/01_before_click.png"
-            await page.screenshot(path=shot1, full_page=True)
-            send_tg_photo(shot1, "点击前网页控制台画面")
-
-            clicked = False
-            for selector in ["button:has-text('Старт')", "button:has-text('Start')", "button:has-text('启动')"]:
-                btn = page.locator(selector).first
-                if await btn.is_visible():
-                    print("🎉 成功锁定网页 [Старт] 按钮，执行点击...")
-                    await btn.click(force=True)
-                    clicked = True
-                    break
-
-            if not clicked:
-                await page.evaluate(
-                    """async () => {
-                        const btns = Array.from(document.querySelectorAll('button'));
-                        const startBtn = btns.find(b => b.innerText.includes('Старт') || b.innerText.includes('Start'));
-                        if (startBtn) startBtn.click();
-                    }"""
-                )
-
-            await page.wait_for_timeout(6000)
-
-            shot2 = "screenshots/02_after_click.png"
-            await page.screenshot(path=shot2, full_page=True)
-            send_tg_photo(shot2, "点击后网页控制台最新画面")
-
+            shot_path = "screenshots/console_status.png"
+            await page.screenshot(path=shot_path, full_page=True)
             await browser.close()
-            return True
+
+            img_url = upload_to_website(shot_path)
+            return img_url
         except Exception as e:
-            print(f"  └─ Playwright 点击过程异常: {e}")
-            err_shot = "screenshots/error_page.png"
-            try:
-                await page.screenshot(path=err_shot)
-                send_tg_photo(err_shot, "异常时的网页画面")
-            except Exception:
-                pass
-            await browser.close()
-            return False
+            print(f"  └─ 网页截图捕捉提示: {e}")
+            return None
 
 
 async def async_main():
@@ -202,43 +176,49 @@ async def async_main():
         print("❌ 错误：未配置 API_KEY！")
         sys.exit(1)
 
-    print("🚀 启动 Rustix 保活脚本 (支持 WebSocket + 网页仿真点击 + 全程截图)...")
+    print("🚀 启动 Rustix 状态检测与保活流程...")
+    
     proxies = {"http": PROXY_URL_SOCKS5H, "https": PROXY_URL_SOCKS5H} if PROXY_URL_SOCKS5H else None
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     }
 
-    init_status = get_server_status(headers, proxies)
-    print(f"📊 初始状态: [{init_status}]")
+    # 1. 查询初始状态
+    init_status, err_reason = get_server_status(headers, proxies)
+    print(f"📊 探测结果: 状态=[{init_status}], 诊断信息=[{err_reason}]")
 
+    # 2. 如果正常运行中，直接完成并退出
     if init_status in ["running", "starting"]:
+        print("🎉 服务器正常运行中，无需触发重启。")
         notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
         sys.exit(0)
 
+    # 3. 如果因 Cloudflare 防火墙问题无法检测状态
+    if "CLOUDFLARE_BLOCKED" in err_reason or "HTTP_403" in err_reason:
+        print("⚠️ 警告: 当前代理节点节点被 Cloudflare 防火墙拦截，尝试通过 WebSocket/Power 指令唤醒...")
+
+    # 4. 尝试通过 WebSocket 下发启动指令
     await trigger_via_websocket(headers, proxies)
-    time.sleep(4)
 
-    current_status = get_server_status(headers, proxies)
-    if current_status not in ["running", "starting"]:
-        await trigger_via_playwright()
+    # 5. 截图并上传网址
+    shot_url = await capture_page_screenshot()
+    link_info = f"\n📸 最新截图链接: {shot_url}" if shot_url else "\n📸 截图请去 GitHub Actions Artifacts 查看"
 
-    final_status = "offline"
-    for i in range(1, 6):
-        time.sleep(4)
-        curr = get_server_status(headers, proxies)
-        print(f"  └─ 轮询第 {i}/5 次: [{curr}]")
-        if curr in ["running", "starting"]:
-            final_status = curr
-            break
+    # 6. 再次轮询确认
+    time.sleep(5)
+    final_status, final_reason = get_server_status(headers, proxies)
 
     if final_status in ["running", "starting"]:
-        notify(f"🚀 Rustix 保活成功！\n\n- 状态变更为: [{final_status.upper()}]")
+        notify(f"🚀 Rustix 保活成功！\n\n- 当前状态: {final_status.upper()}{link_info}")
         sys.exit(0)
+    elif "CLOUDFLARE_BLOCKED" in final_reason:
+        notify(f"⚠️ Rustix 保活提醒：请求被 Cloudflare 防火墙拦截 (HTTP 403)\n\n建议换个 proxy 节点或更新 NODE_LINK，目前无法直接通过 API 获取状态。{link_info}")
+        sys.exit(1)
     else:
-        notify(f"⚠️ Rustix 保活异常！\n\n- 最终状态仍为: [{final_status}]")
+        notify(f"⚠️ Rustix 保活状态: [{final_status}]\n- 诊断信息: {final_reason}{link_info}")
         sys.exit(1)
 
 
