@@ -3,30 +3,12 @@ import sys
 import time
 import json
 import asyncio
-import subprocess
-
-# 1. 动态依赖检查与安装
-required_pkgs = ["requests", "websockets", "playwright", "curl_cffi"]
-for pkg in required_pkgs:
-    try:
-        if pkg == "curl_cffi":
-            from curl_cffi import requests as cffi_requests
-        elif pkg == "websockets":
-            import websockets
-        elif pkg == "playwright":
-            from playwright.async_api import async_playwright
-        else:
-            import requests
-    except ImportError:
-        print(f"📦 自动安装 Python 依赖: {pkg}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "requests[socks]"])
-
 from curl_cffi import requests as cffi_requests
 import requests
 import websockets
 from playwright.async_api import async_playwright
 
-# 2. 环境变量配置
+# 1. 环境变量配置
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 API_KEY = os.getenv("API_KEY", "").strip()
@@ -82,7 +64,7 @@ def upload_to_website(file_path):
 
 
 def get_server_status(headers, proxies):
-    """通过 API 查询服务器真实状态，并处理 Cloudflare 拦截"""
+    """通过 API 查询服务器真实状态"""
     try:
         r = cffi_requests.get(
             f"{BASE_URL}/resources",
@@ -97,18 +79,15 @@ def get_server_status(headers, proxies):
                 state = res_data.get("attributes", {}).get("current_state", "unknown")
                 print(f"  └─ API 响应成功，当前状态: [{state}]")
                 return state, "OK"
-            except Exception as e:
-                print(f"  └─ JSON 解析失败 (可能返回了非 JSON 内容): {e}")
-                return "unknown", "JSON_PARSE_ERROR"
-        elif r.status_code in [403, 503]:
-            print(f"  └─ ⚠️ 被 Cloudflare 拦截 (HTTP {r.status_code})")
-            return "unknown", f"CLOUDFLARE_BLOCKED_{r.status_code}"
+            except Exception:
+                print("  └─ API 返回了非 JSON 结构 (疑似 Cloudflare 人机验证)")
+                return "unknown", "CLOUDFLARE_CHALLENGE"
         else:
-            print(f"  └─ API 返回异常状态码: {r.status_code}")
+            print(f"  └─ API 状态码异常: {r.status_code}")
             return "unknown", f"HTTP_{r.status_code}"
     except Exception as e:
         print(f"  └─ 请求发生网络异常: {e}")
-        return "unknown", f"NETWORK_ERROR"
+        return "unknown", "NETWORK_ERROR"
 
 
 async def trigger_via_websocket(headers, proxies):
@@ -123,7 +102,6 @@ async def trigger_via_websocket(headers, proxies):
             timeout=15,
         )
         if ws_info_res.status_code != 200:
-            print(f"  └─ 获取 WebSocket Token 失败，HTTP 状态码: {ws_info_res.status_code}")
             return False
 
         ws_data = ws_info_res.json().get("data", {})
@@ -145,7 +123,7 @@ async def trigger_via_websocket(headers, proxies):
 
 
 async def capture_page_screenshot():
-    """打开控制台网页进行物理渲染截图并上传"""
+    """使用 Playwright 打开控制台网页进行渲染与截图"""
     print("📸 启动 Playwright 打开控制台网页截图...")
     proxy_config = {"server": PROXY_URL.replace("socks5h://", "socks5://")} if PROXY_URL else None
     
@@ -163,11 +141,12 @@ async def capture_page_screenshot():
             shot_path = "screenshots/console_status.png"
             await page.screenshot(path=shot_path, full_page=True)
             await browser.close()
+            print(f"📸 本地截图已保存至: {shot_path}")
 
             img_url = upload_to_website(shot_path)
             return img_url
         except Exception as e:
-            print(f"  └─ 网页截图捕捉提示: {e}")
+            print(f"  └─ 网页截图捕捉异常: {e}")
             return None
 
 
@@ -186,37 +165,30 @@ async def async_main():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     }
 
-    # 1. 查询初始状态
+    # 1. 探测初始状态
     init_status, err_reason = get_server_status(headers, proxies)
     print(f"📊 探测结果: 状态=[{init_status}], 诊断信息=[{err_reason}]")
 
-    # 2. 如果正常运行中，直接完成并退出
+    # 2. 如果正常运行，直接退出
     if init_status in ["running", "starting"]:
         print("🎉 服务器正常运行中，无需触发重启。")
         notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
         sys.exit(0)
 
-    # 3. 如果因 Cloudflare 防火墙问题无法检测状态
-    if "CLOUDFLARE_BLOCKED" in err_reason or "HTTP_403" in err_reason:
-        print("⚠️ 警告: 当前代理节点节点被 Cloudflare 防火墙拦截，尝试通过 WebSocket/Power 指令唤醒...")
-
-    # 4. 尝试通过 WebSocket 下发启动指令
+    # 3. 尝试下发 WebSocket 命令拉起
     await trigger_via_websocket(headers, proxies)
 
-    # 5. 截图并上传网址
+    # 4. 强制执行 Playwright 截图
     shot_url = await capture_page_screenshot()
-    link_info = f"\n📸 最新截图链接: {shot_url}" if shot_url else "\n📸 截图请去 GitHub Actions Artifacts 查看"
+    link_info = f"\n📸 最新截图链接: {shot_url}" if shot_url else "\n📸 截图文件已打包存入 GitHub Artifacts"
 
-    # 6. 再次轮询确认
+    # 5. 再次轮询确认状态
     time.sleep(5)
     final_status, final_reason = get_server_status(headers, proxies)
 
     if final_status in ["running", "starting"]:
         notify(f"🚀 Rustix 保活成功！\n\n- 当前状态: {final_status.upper()}{link_info}")
         sys.exit(0)
-    elif "CLOUDFLARE_BLOCKED" in final_reason:
-        notify(f"⚠️ Rustix 保活提醒：请求被 Cloudflare 防火墙拦截 (HTTP 403)\n\n建议换个 proxy 节点或更新 NODE_LINK，目前无法直接通过 API 获取状态。{link_info}")
-        sys.exit(1)
     else:
         notify(f"⚠️ Rustix 保活状态: [{final_status}]\n- 诊断信息: {final_reason}{link_info}")
         sys.exit(1)
