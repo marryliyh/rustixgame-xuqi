@@ -1,21 +1,21 @@
 import os
 import sys
 import time
-import asyncio
-import subprocess
 import json
+import subprocess
 
-# 自动检查并安装必要依赖
-for pkg in ["requests", "playwright"]:
+# 强制安装与更新 SeleniumBase 物理穿透引擎
+for pkg in ["seleniumbase", "requests"]:
     try:
         __import__(pkg)
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        print(f"📦 正在自动安装底层物理穿透依赖: {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", pkg])
 
 import requests
-from playwright.async_api import async_playwright
+from seleniumbase import Driver
 
-# 环境变量
+# 环境变量配置
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 API_KEY = os.getenv("API_KEY", "").strip()
@@ -23,172 +23,153 @@ PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808").strip()
 
 SERVER_ID = "226fd977"
 BASE_URL = "https://my.rustix.me"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
 
 def notify(text):
-    """专属 Telegram 通知 (严格按照你的配置要求)"""
+    """发送 Telegram 消息通知"""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": f"Rustix 自动保活\n\n{text}"},
+            json={"chat_id": TG_CHAT_ID, "text": f"Rustix 自动保活通知\n\n{text}"},
             timeout=15,
         )
     except Exception as e:
-        print(f"[TG] 通知失败: {e}")
+        print(f"[TG] 通知发送失败: {e}")
 
-async def wait_for_cloudflare(page):
-    """核心修复：死等 Cloudflare 盾解开，只有解开了才能发起 API 请求"""
-    print("⏳ 正在等待 Cloudflare 防火墙解算通过...")
-    for _ in range(30):
-        title = await page.title()
-        # 只要标题不是 CF 的提示，就说明进入了真正的网站
-        if "Just a moment" not in title and "Cloudflare" not in title and title.strip() != "":
-            print(f"  └─ ✅ 成功突破 CF 防火墙！当前页面标题: [{title}]")
-            return True
-        
-        # 尝试点一下可能存在的 Turnstile 验证框
-        try:
-            for frame in page.frames:
-                if "challenges.cloudflare.com" in frame.url:
-                    box = await frame.query_selector(".recaptcha-checkbox, #challenge-stage")
-                    if box:
-                        await box.click(force=True)
-        except Exception:
-            pass
-        
-        await asyncio.sleep(1)
-    return False
 
-async def async_main():
+def main():
     if not API_KEY:
         print("❌ 错误：未配置 API_KEY！")
         sys.exit(1)
 
-    print("🚀 启动 Rustix 保活 (桌面级浏览器直连 + 强行穿透模式)...")
+    print("🚀 启动 Rustix 终极保活引擎 (SeleniumBase UC 模式 + OS 级物理坐标击穿)...")
 
-    proxy_server = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
-    proxy_config = {"server": proxy_server} if proxy_server else None
+    # 配置代理 (SeleniumBase 支持 socks5 代理格式)
+    proxy_str = PROXY_URL if PROXY_URL else None
 
-    async with async_playwright() as p:
-        # headless=False 配合 Xvfb 伪装真实桌面环境
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            proxy=proxy_config,
-        )
+    # 初始化 SeleniumBase UC (Undetected-Chromedriver) 真机避险内核
+    driver = Driver(
+        uc=True,
+        headless=False,  # 配合 Xvfb 显示真实 GUI 窗口，避免 Cloudflare 无头指纹拦截
+        proxy=proxy_str,
+        page_load_strategy="normal",
+    )
 
-        # bypass_csp=True 彻底关闭页面内的跨域和安全请求拦截，解决 Failed to fetch
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 768},
-            bypass_csp=True, 
-        )
-        page = await context.new_page()
+    try:
+        # 1. 带自动重连与 TLS 握手伪装地打开目标主页
+        print("🌐 步骤 1: 启动 UC 浏览器，伪装物理指纹访问主页...")
+        driver.uc_open_with_reconnect(BASE_URL, reconnect_time=6)
 
-        # 消除 webdriver 痕迹
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        # 1. 访问网站建立连接
-        print("🌐 步骤 1: 访问主页并获取授权...")
+        # 2. 触发底层 OS 坐标物理点击击穿 Cloudflare Turnstile 人机验证框
+        print("⏳ 步骤 2: 正在执行物理 GUI 坐标点击算法击穿 Cloudflare 防火墙...")
         try:
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            # 自动寻找 Turnstile 验证框并使用 PyAutoGUI / xdotool 模拟真实鼠标轨迹点击
+            driver.uc_gui_click_captcha()
+            print("  └─ 🎯 物理点击指令已下发！")
         except Exception as e:
-            print(f"  └─ 页面初始加载异常: {e}")
+            print(f"  └─ 物理点击识别提示: {e}")
 
-        # 强制等待 CF 盾解开，过不了盾绝不发请求
-        passed = await wait_for_cloudflare(page)
-        if not passed:
-            print("⚠️ 警告: 似乎未能在规定时间内解开 CF，将强行尝试执行指令...")
+        # 等待页面通过 CF 校验并获取 cf_clearance
+        time.sleep(5)
 
-        # 万能请求工具 (利用当前已通行的页面环境)
-        async def run_fetch(endpoint, method="GET", body=None):
-            js_code = """
-            async ({ endpoint, method, apiKey, body }) => {
-                try {
-                    const options = {
-                        method: method,
-                        headers: {
-                            'Authorization': 'Bearer ' + apiKey,
-                            'Accept': 'application/json',
-                            'Content-Type': 'application/json'
-                        }
-                    };
-                    if (body) {
-                        options.body = JSON.stringify(body);
-                    }
-                    const res = await fetch(endpoint, options);
-                    const text = await res.text();
-                    try {
-                        return { ok: res.ok, status: res.status, data: JSON.parse(text) };
-                    } catch(e) {
-                        return { ok: res.ok, status: res.status, raw: text };
-                    }
-                } catch (err) {
-                    return { ok: false, status: 0, error: err.name + ': ' + err.message };
-                }
-            }
-            """
-            return await page.evaluate(js_code, {
-                "endpoint": f"/api/client/servers/{SERVER_ID}/{endpoint}",
-                "method": method,
-                "apiKey": API_KEY,
-                "body": body
-            })
+        # 验证页面标题，确认完全通过 Cloudflare 盾
+        for attempt in range(1, 15):
+            title = driver.title
+            if "Just a moment" not in title and "Cloudflare" not in title and title.strip() != "":
+                print(f"  └─ ✅ 防火墙击穿成功！目标页面标题: [{title}]")
+                break
+            time.sleep(1)
 
-        # 2. 检查服务器是否启动
-        print("🔍 步骤 2: 检查服务器当前运行状态...")
-        res_info = await run_fetch("resources", "GET")
-        
+        # 3. 在完全解算且带有合法 cf_clearance Cookie 的浏览器环境中执行 API 查询
+        print("🔍 步骤 3: 在已放行的浏览器栈内执行 API 查询运行状态...")
+        get_status_js = f"""
+        var callback = arguments[arguments.length - 1];
+        fetch('/api/client/servers/{SERVER_ID}/resources', {{
+            method: 'GET',
+            headers: {{
+                'Authorization': 'Bearer {API_KEY}',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }}
+        }})
+        .then(response => response.json().then(data => ({ status: response.status, data: data })))
+        .then(res => callback(res))
+        .catch(err => callback({{ status: 0, error: err.toString() }}));
+        """
+
+        res_info = driver.execute_async_script(get_status_js)
         init_status = "unknown"
-        if res_info.get("ok") and "data" in res_info:
-            init_status = res_info["data"].get("attributes", {}).get("current_state", "unknown")
-            print(f"  └─ 当前服务器状态: [{init_status}]")
-        else:
-            print(f"  └─ 状态获取失败: {res_info}")
 
-        # 如果已经是启动状态，直接结束
+        if res_info and res_info.get("status") == 200:
+            init_status = res_info.get("data", {}).get("attributes", {}).get("current_state", "unknown")
+            print(f"  └─ 当前服务器状态: [{init_status.upper()}]")
+        else:
+            print(f"  └─ API 读取反馈: {res_info}")
+
+        # 如果服务器已经在运行中，直接退出并通知
         if init_status in ["running", "starting"]:
-            print("🎉 服务器正在运行，无需重复启动。")
-            notify(f"✅ 服务器运行正常\n当前状态: [{init_status.upper()}]")
-            await browser.close()
+            print("🎉 服务器正处于启动/运行状态，无需再次点击开机。")
+            notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: [{init_status.upper()}]")
+            driver.quit()
             sys.exit(0)
 
-        # 3. 停止状态，立刻执行启动指令
-        print(f"⚡ 步骤 3: 状态为 [{init_status}]，立即发送开机指令...")
-        power_res = await run_fetch("power", "POST", {"signal": "start"})
-        print(f"  └─ 开机指令执行结果: HTTP {power_res.get('status', 0)}")
+        # 4. 如果处于停止/未知状态，下发开机指令
+        print(f"⚡ 步骤 4: 当前状态为 [{init_status}]，下发 [start] 电源启动指令...")
+        send_start_js = f"""
+        var callback = arguments[arguments.length - 1];
+        fetch('/api/client/servers/{SERVER_ID}/power', {{
+            method: 'POST',
+            headers: {{
+                'Authorization': 'Bearer {API_KEY}',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }},
+            body: JSON.stringify({{ signal: 'start' }})
+        }})
+        .then(response => callback({{ status: response.status }}))
+        .catch(err => callback({{ status: 0, error: err.toString() }}));
+        """
 
-        # 4. 轮询确认状态
-        print("⏳ 步骤 4: 轮询确认是否启动成功...")
-        final_status = init_status
+        power_res = driver.execute_async_script(send_start_js)
+        p_code = power_res.get("status", 0) if power_res else 0
+        print(f"  └─ 电源指令响应 HTTP 状态码: {p_code}")
+
+        # 5. 轮询确认服务器状态变更
+        print("⏳ 步骤 5: 轮询确认服务器状态更新...")
+        final_status = "unknown"
         for i in range(1, 6):
-            await asyncio.sleep(4)
-            check_info = await run_fetch("resources", "GET")
-            if check_info.get("ok") and "data" in check_info:
-                curr = check_info["data"].get("attributes", {}).get("current_state", "unknown")
-                print(f"  └─ 轮询第 {i}/5 次状态: [{curr}]")
-                final_status = curr
+            time.sleep(4)
+            check_res = driver.execute_async_script(get_status_js)
+            if check_res and check_res.get("status") == 200:
+                curr = check_res.get("data", {}).get("attributes", {}).get("current_state", "unknown")
+                print(f"  └─ 轮询第 {i}/5 次状态: [{curr.upper()}]")
                 if curr in ["running", "starting"]:
+                    final_status = curr
                     break
 
-        await browser.close()
+        driver.quit()
 
-        # 5. 通知结果
+        # 6. 判定结果并发送通知
         if final_status in ["running", "starting"]:
-            notify(f"🚀 服务器已成功唤醒！\n最新状态: [{final_status.upper()}]")
+            notify(f"🚀 Rustix 保活成功！\n\n- 最新状态: [{final_status.upper()}]")
+            sys.exit(0)
+        elif p_code in [200, 204]:
+            notify(f"🚀 Rustix 开机信号已送达！\n\n- API 响应: HTTP {p_code}\n- 指令已送达后台。")
             sys.exit(0)
         else:
-            notify(f"❌ 服务器唤醒可能失败\n初始状态: [{init_status}]\n最终状态: [{final_status}]")
+            notify(f"❌ Rustix 启动失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
             sys.exit(1)
 
-def main():
-    asyncio.run(async_main())
+    except Exception as e:
+        print(f"❌ 运行遇到异常: {e}")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
