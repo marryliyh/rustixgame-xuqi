@@ -2,7 +2,7 @@ name: Rustix Auto Restart
 
 on:
   schedule:
-    - cron: '37 */4 * * *'
+    - cron: '37 */2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -28,8 +28,7 @@ jobs:
           sudo apt-get install -y xvfb
           pip install --upgrade pip
           pip install playwright requests curl_cffi websockets requests[socks]
-          playwright install chrome
-          playwright install-deps
+          playwright install --with-deps chromium
 
       - name: Install and start sing-box
         env:
