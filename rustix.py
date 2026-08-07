@@ -5,16 +5,18 @@ import json
 import asyncio
 import subprocess
 
-# 自动检查并补全必要依赖
-for pkg in ["requests", "playwright", "curl_cffi"]:
+# 自动检查并补全依赖 (包含 PySocks)
+for pkg in ["requests", "playwright", "PySocks"]:
     try:
-        __import__(pkg)
+        if pkg == "PySocks":
+            __import__("socks")
+        else:
+            __import__(pkg)
     except ImportError:
         print(f"📦 正在自动安装依赖: {pkg}...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "requests[socks]"])
 
 import requests
-from curl_cffi import requests as cffi_requests
 from playwright.async_api import async_playwright
 
 # 环境变量配置
@@ -44,10 +46,94 @@ def notify(text):
         print(f"[TG] 通知发送失败: {e}")
 
 
-async def pass_cf_and_get_session():
-    """使用 Playwright 启动 Chromium，自动识别并点击 Turnstile 验证框突破 Cloudflare，提取 clearance Cookie"""
-    print("🌐 步骤 0: 启动 Playwright 穿透 Cloudflare 防火墙与 Turnstile 人机验证...")
-    
+async def handle_cors_route(route):
+    """拦截 OPTIONS 跨域预检请求并强制返回 200，解决浏览器 fetch 被 CORS 阻断的问题"""
+    if route.request.method == "OPTIONS":
+        await route.fulfill(
+            status=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+    else:
+        await route.continue_()
+
+
+async def browser_fetch(page, url, method="GET", body=None):
+    """在已连通的浏览器上下文内部执行原生 fetch"""
+    js_script = """
+    async ({ url, method, apiKey, body }) => {
+        try {
+            const options = {
+                method: method,
+                headers: {
+                    'Authorization': 'Bearer ' + apiKey,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                }
+            };
+            if (body) {
+                options.body = JSON.stringify(body);
+            }
+            const res = await fetch(url, options);
+            const text = await res.text();
+            return { status: res.status, text: text };
+        } catch (err) {
+            return { status: 0, text: err.name + ': ' + err.message };
+        }
+    }
+    """
+    res = await page.evaluate(js_script, {"url": url, "method": method, "apiKey": API_KEY, "body": body})
+    status = res.get("status", 0)
+    text = res.get("text", "")
+    data = None
+    if text:
+        try:
+            data = json.loads(text)
+        except Exception:
+            pass
+    return status, data, text
+
+
+def requests_fallback(endpoint, method="GET", body=None):
+    """标准 Python requests + PySocks 兜底请求 (基于 OpenSSL，完全避开 BoringSSL 的 SOCKS5 崩溃 bug)"""
+    url = f"{BASE_URL}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    proxies = {
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    } if PROXY_URL else None
+
+    try:
+        if method == "GET":
+            res = requests.get(url, headers=headers, proxies=proxies, timeout=20)
+        else:
+            res = requests.post(url, headers=headers, json=body, proxies=proxies, timeout=20)
+        
+        data = None
+        try:
+            data = res.json()
+        except Exception:
+            pass
+        return res.status_code, data, res.text
+    except Exception as e:
+        return 0, None, str(e)
+
+
+async def async_main():
+    if not API_KEY:
+        print("❌ 错误：未配置 API_KEY！")
+        sys.exit(1)
+
+    print("🚀 启动 Rustix 保活流程 (Chromium 预检接管 + PySocks 物理重试双保险模式)...")
+
     proxy_pw = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
     proxy_config = {"server": proxy_pw} if proxy_pw else None
 
@@ -59,6 +145,7 @@ async def pass_cf_and_get_session():
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
             ],
             proxy=proxy_config,
         )
@@ -66,163 +153,95 @@ async def pass_cf_and_get_session():
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
-            locale="zh-CN",
         )
         page = await context.new_page()
 
-        # 抹除 webdriver 特征标识
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # 注册路由拦截，自动回应并放行预检 OPTIONS
+        await page.route("**/api/**", handle_cors_route)
 
+        # 1. 打开控制台主页建立网络连接通道
+        print("🌐 步骤 1: 访问 Rustix 控制台建立通道...")
         try:
-            print("⏳ 正在载入 Rustix 控制台主页...")
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            res = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            print(f"  └─ 主页响应 HTTP 状态码: {res.status if res else '200'}")
         except Exception as e:
-            print(f"  └─ 初始加载提示: {e}")
+            print(f"  └─ 页面建立提示: {e}")
 
-        # 循环检测与点击 Cloudflare Turnstile 验证框
-        passed = False
-        for i in range(1, 25):
-            await asyncio.sleep(1)
-            title = await page.title()
-            cookies = await context.cookies()
-            has_clearance = any(c.get("name") == "cf_clearance" for c in cookies)
+        await page.wait_for_timeout(5000)
+        await page.screenshot(path="screenshots/rustix_ready.png")
 
-            if "Just a moment" not in title and "Cloudflare" not in title:
-                print(f"  └─ ✅ 页面已成功通过 Cloudflare 盾！标题: [{title}]")
-                passed = True
-                break
+        # 2. 查询服务器初始状态
+        print("🔍 步骤 2: 请求 API 探测服务器当前状态...")
+        status_url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources"
+        code, json_data, raw_text = await browser_fetch(page, status_url, "GET")
 
-            # 检索 Turnstile iframe 框架并自动执行模拟点击
-            try:
-                for frame in page.frames:
-                    if "challenges.cloudflare.com" in frame.url:
-                        cb = await frame.query_selector("input[type='checkbox'], .recaptcha-checkbox, #challenge-stage")
-                        if cb:
-                            print(f"  └─ 🎯 (第 {i}s) 检测到 Turnstile 验证复选框，正在模拟物理点击...")
-                            await cb.click()
-            except Exception:
-                pass
+        # 若浏览器上下文 fetch 失败或被拦截，自动无缝切入 PySocks 管道重试
+        if code == 0 or not json_data:
+            print(f"  └─ 浏览器上下文提示 [{raw_text[:60]}]，自动启用 PySocks 原生通道重试...")
+            code, json_data, raw_text = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
 
-        await page.screenshot(path="screenshots/cf_pass_result.png")
-        cookies_list = await context.cookies()
-        actual_ua = await page.evaluate("navigator.userAgent")
-        await browser.close()
-
-        cookie_dict = {c["name"]: c["value"] for c in cookies_list}
-        print(f"  └─ 获取 Cookies 数量: {len(cookie_dict)} 项 (包含 clearance: {any(c == 'cf_clearance' for c in cookie_dict)})")
-        return cookie_dict, actual_ua
-
-
-def main():
-    if not API_KEY:
-        print("❌ 错误：未配置 API_KEY！")
-        sys.exit(1)
-
-    print("🚀 启动 Rustix 保活流程 (Turnstile 自动解算 + socks5h 远程 DNS 模式)...")
-
-    # 1. 自动穿透 Cloudflare 并提取验证 Cookie
-    cookies, ua = asyncio.run(pass_cf_and_get_session())
-
-    # 强制将 SOCKS5 代理转换为 socks5h:// (由代理端执行远程 DNS 解析，解决 SSL_connect 握手中断问题)
-    cffi_proxy = PROXY_URL
-    if cffi_proxy.startswith("socks5://"):
-        cffi_proxy = cffi_proxy.replace("socks5://", "socks5h://")
-
-    proxies = {
-        "http": cffi_proxy,
-        "https": cffi_proxy,
-    } if cffi_proxy else None
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": ua or USER_AGENT,
-    }
-
-    session = cffi_requests.Session()
-    session.headers.update(headers)
-    if cookies:
-        session.cookies.update(cookies)
-
-    # 2. 查询服务器初始状态
-    print("🔍 步骤 1: 请求 API 探测服务器当前状态...")
-    init_status = "unknown"
-    try:
-        res = session.get(
-            f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=20,
-        )
-        print(f"  └─ API HTTP 状态码: {res.status_code}")
-        if res.status_code == 200:
-            data = res.json()
-            init_status = data.get("attributes", {}).get("current_state", "unknown")
-            print(f"  └─ 当前服务器状态: [{init_status}]")
+        init_status = "unknown"
+        if json_data and isinstance(json_data, dict):
+            init_status = json_data.get("attributes", {}).get("current_state", "unknown")
+            print(f"  └─ 查询成功，当前服务器状态: [{init_status}]")
         else:
-            print(f"  └─ 响应片段: {res.text[:150]}")
-    except Exception as e:
-        print(f"  └─ API 请求异常: {e}")
+            print(f"  └─ 接口响应 HTTP {code}，片段: {raw_text[:120]}")
 
-    # 若正在运行则直接成功退出
-    if init_status in ["running", "starting"]:
-        print("🎉 服务器正在正常运行中，无需重复开启。")
-        notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
-        sys.exit(0)
+        # 若正在运行，直接通知并成功退出
+        if init_status in ["running", "starting"]:
+            print("🎉 服务器正在正常运行中，无需开启。")
+            notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
+            await browser.close()
+            sys.exit(0)
 
-    # 3. 发送开机指令
-    print("⚡ 步骤 2: 下发 [start] 电源指令...")
-    power_success = False
-    p_code = 0
-    try:
-        p_res = session.post(
-            f"{BASE_URL}/api/client/servers/{SERVER_ID}/power",
-            json={"signal": "start"},
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=20,
-        )
-        p_code = p_res.status_code
-        print(f"  └─ 电源指令 HTTP 状态码: {p_code}")
-        if p_code in [200, 204]:
-            power_success = True
-    except Exception as e:
-        print(f"  └─ 电源指令发送异常: {e}")
+        # 3. 发送开机指令
+        print("⚡ 步骤 3: 下发 [start] 电源指令...")
+        power_url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/power"
+        p_code, p_json, p_raw = await browser_fetch(page, power_url, "POST", {"signal": "start"})
 
-    # 4. 轮询确认状态变更
-    print("⏳ 步骤 3: 轮询确认服务器状态变更...")
-    final_status = "unknown"
-    for i in range(1, 6):
-        time.sleep(4)
-        try:
-            check_res = session.get(
-                f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
-                proxies=proxies,
-                impersonate="chrome120",
-                timeout=20,
+        if p_code == 0:
+            print("  └─ 切换为 PySocks 通道下发电源指令...")
+            p_code, p_json, p_raw = requests_fallback(
+                f"/api/client/servers/{SERVER_ID}/power", "POST", {"signal": "start"}
             )
-            if check_res.status_code == 200:
-                curr = check_res.json().get("attributes", {}).get("current_state", "unknown")
+
+        print(f"  └─ [start] 指令响应状态码: HTTP {p_code}")
+        power_success = p_code in [200, 204]
+
+        # 4. 轮询确认开机状态
+        print("⏳ 步骤 4: 轮询确认服务器状态更新...")
+        final_status = "unknown"
+        for i in range(1, 6):
+            await asyncio.sleep(4)
+            c_code, c_json, _ = await browser_fetch(page, status_url, "GET")
+            if c_code == 0 or not c_json:
+                c_code, c_json, _ = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
+
+            if c_json and isinstance(c_json, dict):
+                curr = c_json.get("attributes", {}).get("current_state", "unknown")
                 print(f"  └─ 轮询第 {i}/5 次状态: [{curr}]")
                 if curr in ["running", "starting"]:
                     final_status = curr
                     break
             else:
-                print(f"  └─ 轮询第 {i}/5 次响应 HTTP {check_res.status_code}")
-        except Exception as e:
-            print(f"  └─ 轮询网络异常: {e}")
+                print(f"  └─ 轮询第 {i}/5 次 HTTP {c_code}")
 
-    # 5. 结果判定与 Telegram 通知
-    if final_status in ["running", "starting"]:
-        notify(f"🚀 Rustix 保活成功！\n\n- 当前最新状态: [{final_status.upper()}]")
-        sys.exit(0)
-    elif power_success:
-        notify(f"🚀 Rustix 开机指令下发成功！\n\n- API 响应: HTTP {p_code}\n- 开机指令已成功送达服务端后台。")
-        sys.exit(0)
-    else:
-        notify(f"❌ Rustix 保活失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
-        sys.exit(1)
+        await browser.close()
+
+        # 5. 结果判定与 Telegram 通知
+        if final_status in ["running", "starting"]:
+            notify(f"🚀 Rustix 保活成功！\n\n- 当前最新状态: [{final_status.upper()}]")
+            sys.exit(0)
+        elif power_success:
+            notify(f"🚀 Rustix 开机指令下发成功！\n\n- API 响应: HTTP {p_code}\n- 开机信号已成功送达后台。")
+            sys.exit(0)
+        else:
+            notify(f"❌ Rustix 保活失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
+            sys.exit(1)
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
