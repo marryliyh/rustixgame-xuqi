@@ -5,7 +5,7 @@ import json
 import asyncio
 import subprocess
 
-# 自动检查并补全依赖 (包含 PySocks)
+# 自动检查并补全必要依赖 (包含 PySocks)
 for pkg in ["requests", "playwright", "PySocks"]:
     try:
         if pkg == "PySocks":
@@ -46,59 +46,18 @@ def notify(text):
         print(f"[TG] 通知发送失败: {e}")
 
 
-async def handle_cors_route(route):
-    """拦截 OPTIONS 跨域预检请求并强制返回 200，解决浏览器 fetch 被 CORS 阻断的问题"""
-    if route.request.method == "OPTIONS":
-        await route.fulfill(
-            status=200,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-                "Access-Control-Allow-Headers": "*",
-            },
-        )
-    else:
-        await route.continue_()
-
-
-async def browser_fetch(page, url, method="GET", body=None):
-    """在已连通的浏览器上下文内部执行原生 fetch"""
-    js_script = """
-    async ({ url, method, apiKey, body }) => {
-        try {
-            const options = {
-                method: method,
-                headers: {
-                    'Authorization': 'Bearer ' + apiKey,
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                }
-            };
-            if (body) {
-                options.body = JSON.stringify(body);
-            }
-            const res = await fetch(url, options);
-            const text = await res.text();
-            return { status: res.status, text: text };
-        } catch (err) {
-            return { status: 0, text: err.name + ': ' + err.message };
-        }
-    }
-    """
-    res = await page.evaluate(js_script, {"url": url, "method": method, "apiKey": API_KEY, "body": body})
-    status = res.get("status", 0)
-    text = res.get("text", "")
-    data = None
-    if text:
-        try:
-            data = json.loads(text)
-        except Exception:
-            pass
-    return status, data, text
+def get_socks5h_proxy():
+    """将 socks5:// 转换为 socks5h://，强制使用代理端远程 DNS 解析"""
+    if not PROXY_URL:
+        return None
+    p = PROXY_URL
+    if p.startswith("socks5://"):
+        p = p.replace("socks5://", "socks5h://")
+    return {"http": p, "https": p}
 
 
 def requests_fallback(endpoint, method="GET", body=None):
-    """标准 Python requests + PySocks 兜底请求 (基于 OpenSSL，完全避开 BoringSSL 的 SOCKS5 崩溃 bug)"""
+    """基于 OpenSSL + socks5h 远程 DNS 解析的物理重试请求"""
     url = f"{BASE_URL}{endpoint}"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -106,10 +65,7 @@ def requests_fallback(endpoint, method="GET", body=None):
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
-    proxies = {
-        "http": PROXY_URL,
-        "https": PROXY_URL,
-    } if PROXY_URL else None
+    proxies = get_socks5h_proxy()
 
     try:
         if method == "GET":
@@ -127,12 +83,53 @@ def requests_fallback(endpoint, method="GET", body=None):
         return 0, None, str(e)
 
 
+async def get_status_via_page(page):
+    """利用 Chromium 浏览器原生页面导航读取 API 节点 (绕过 CSP 和 JS CORS 限制)"""
+    url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources"
+    try:
+        res = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        status_code = res.status if res else 0
+        text = await page.inner_text("body")
+        data = None
+        try:
+            data = json.loads(text)
+        except Exception:
+            pass
+        return status_code, data, text
+    except Exception as e:
+        return 0, None, str(e)
+
+
+async def send_power_via_xhr(page):
+    """利用注入的页面 XHR 发送开机指令"""
+    url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/power"
+    js_xhr = """
+    async ({ url, apiKey }) => {
+        return new Promise((resolve) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", url, true);
+            xhr.setRequestHeader("Authorization", "Bearer " + apiKey);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.setRequestHeader("Accept", "application/json");
+            xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
+            xhr.onerror = () => resolve({ status: 0, text: "XHR Error" });
+            xhr.send(JSON.stringify({ signal: "start" }));
+        });
+    }
+    """
+    try:
+        res = await page.evaluate(js_xhr, {"url": url, "apiKey": API_KEY})
+        return res.get("status", 0), res.get("text", "")
+    except Exception as e:
+        return 0, str(e)
+
+
 async def async_main():
     if not API_KEY:
         print("❌ 错误：未配置 API_KEY！")
         sys.exit(1)
 
-    print("🚀 启动 Rustix 保活流程 (Chromium 预检接管 + PySocks 物理重试双保险模式)...")
+    print("🚀 启动 Rustix 保活流程 (Chromium 页面直连 + socks5h 远程 DNS 双路径模式)...")
 
     proxy_pw = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
     proxy_config = {"server": proxy_pw} if proxy_pw else None
@@ -150,34 +147,33 @@ async def async_main():
             proxy=proxy_config,
         )
 
+        # 挂载全局 Authorization 认证头
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
+            extra_http_headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Accept": "application/json",
+            },
         )
         page = await context.new_page()
 
-        # 注册路由拦截，自动回应并放行预检 OPTIONS
-        await page.route("**/api/**", handle_cors_route)
-
-        # 1. 打开控制台主页建立网络连接通道
-        print("🌐 步骤 1: 访问 Rustix 控制台建立通道...")
+        # 1. 访问主页建立网络连接通道
+        print("🌐 步骤 1: 访问 Rustix 控制台主页建立连接...")
         try:
             res = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-            print(f"  └─ 主页响应 HTTP 状态码: {res.status if res else '200'}")
+            print(f"  └─ 主页响应状态码: HTTP {res.status if res else '200'}")
         except Exception as e:
-            print(f"  └─ 页面建立提示: {e}")
+            print(f"  └─ 主页访问提示: {e}")
 
-        await page.wait_for_timeout(5000)
-        await page.screenshot(path="screenshots/rustix_ready.png")
+        await asyncio.sleep(5)
 
         # 2. 查询服务器初始状态
         print("🔍 步骤 2: 请求 API 探测服务器当前状态...")
-        status_url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources"
-        code, json_data, raw_text = await browser_fetch(page, status_url, "GET")
+        code, json_data, raw_text = await get_status_via_page(page)
 
-        # 若浏览器上下文 fetch 失败或被拦截，自动无缝切入 PySocks 管道重试
-        if code == 0 or not json_data:
-            print(f"  └─ 浏览器上下文提示 [{raw_text[:60]}]，自动启用 PySocks 原生通道重试...")
+        if code != 200 or not json_data:
+            print(f"  └─ 浏览器页面读取非 200 (HTTP {code})，自动切换至 socks5h 远程 DNS 通道...")
             code, json_data, raw_text = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
 
         init_status = "unknown"
@@ -185,23 +181,22 @@ async def async_main():
             init_status = json_data.get("attributes", {}).get("current_state", "unknown")
             print(f"  └─ 查询成功，当前服务器状态: [{init_status}]")
         else:
-            print(f"  └─ 接口响应 HTTP {code}，片段: {raw_text[:120]}")
+            print(f"  └─ 接口响应 HTTP {code}，内容: {raw_text[:120]}")
 
         # 若正在运行，直接通知并成功退出
         if init_status in ["running", "starting"]:
-            print("🎉 服务器正在正常运行中，无需开启。")
+            print("🎉 服务器正在正常运行中，无需重启。")
             notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
             await browser.close()
             sys.exit(0)
 
         # 3. 发送开机指令
         print("⚡ 步骤 3: 下发 [start] 电源指令...")
-        power_url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/power"
-        p_code, p_json, p_raw = await browser_fetch(page, power_url, "POST", {"signal": "start"})
+        p_code, p_raw = await send_power_via_xhr(page)
 
-        if p_code == 0:
-            print("  └─ 切换为 PySocks 通道下发电源指令...")
-            p_code, p_json, p_raw = requests_fallback(
+        if p_code not in [200, 204]:
+            print(f"  └─ 页面 XHR 响应 HTTP {p_code}，切换为 socks5h 远程 DNS 通道重试...")
+            p_code, _, p_raw = requests_fallback(
                 f"/api/client/servers/{SERVER_ID}/power", "POST", {"signal": "start"}
             )
 
@@ -213,8 +208,8 @@ async def async_main():
         final_status = "unknown"
         for i in range(1, 6):
             await asyncio.sleep(4)
-            c_code, c_json, _ = await browser_fetch(page, status_url, "GET")
-            if c_code == 0 or not c_json:
+            c_code, c_json, _ = await get_status_via_page(page)
+            if c_code != 200 or not c_json:
                 c_code, c_json, _ = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
 
             if c_json and isinstance(c_json, dict):
