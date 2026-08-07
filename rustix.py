@@ -5,16 +5,13 @@ import json
 import asyncio
 import subprocess
 
-# 自动检查并补全必要依赖 (包含 PySocks)
-for pkg in ["requests", "playwright", "PySocks"]:
+# 补全必要依赖
+for pkg in ["requests", "playwright"]:
     try:
-        if pkg == "PySocks":
-            __import__("socks")
-        else:
-            __import__(pkg)
+        __import__(pkg)
     except ImportError:
         print(f"📦 正在自动安装依赖: {pkg}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "requests[socks]"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 import requests
 from playwright.async_api import async_playwright
@@ -46,192 +43,144 @@ def notify(text):
         print(f"[TG] 通知发送失败: {e}")
 
 
-def get_socks5h_proxy():
-    """将 socks5:// 转换为 socks5h://，强制使用代理端远程 DNS 解析"""
-    if not PROXY_URL:
-        return None
-    p = PROXY_URL
-    if p.startswith("socks5://"):
-        p = p.replace("socks5://", "socks5h://")
-    return {"http": p, "https": p}
-
-
-def requests_fallback(endpoint, method="GET", body=None):
-    """基于 OpenSSL + socks5h 远程 DNS 解析的物理重试请求"""
-    url = f"{BASE_URL}{endpoint}"
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    proxies = get_socks5h_proxy()
-
-    try:
-        if method == "GET":
-            res = requests.get(url, headers=headers, proxies=proxies, timeout=20)
-        else:
-            res = requests.post(url, headers=headers, json=body, proxies=proxies, timeout=20)
-        
-        data = None
-        try:
-            data = res.json()
-        except Exception:
-            pass
-        return res.status_code, data, res.text
-    except Exception as e:
-        return 0, None, str(e)
-
-
-async def get_status_via_page(page):
-    """利用 Chromium 浏览器原生页面导航读取 API 节点 (绕过 CSP 和 JS CORS 限制)"""
-    url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources"
-    try:
-        res = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        status_code = res.status if res else 0
-        text = await page.inner_text("body")
-        data = None
-        try:
-            data = json.loads(text)
-        except Exception:
-            pass
-        return status_code, data, text
-    except Exception as e:
-        return 0, None, str(e)
-
-
-async def send_power_via_xhr(page):
-    """利用注入的页面 XHR 发送开机指令"""
-    url = f"{BASE_URL}/api/client/servers/{SERVER_ID}/power"
-    js_xhr = """
-    async ({ url, apiKey }) => {
-        return new Promise((resolve) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open("POST", url, true);
-            xhr.setRequestHeader("Authorization", "Bearer " + apiKey);
-            xhr.setRequestHeader("Content-Type", "application/json");
-            xhr.setRequestHeader("Accept", "application/json");
-            xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
-            xhr.onerror = () => resolve({ status: 0, text: "XHR Error" });
-            xhr.send(JSON.stringify({ signal: "start" }));
-        });
-    }
-    """
-    try:
-        res = await page.evaluate(js_xhr, {"url": url, "apiKey": API_KEY})
-        return res.get("status", 0), res.get("text", "")
-    except Exception as e:
-        return 0, str(e)
-
-
 async def async_main():
     if not API_KEY:
         print("❌ 错误：未配置 API_KEY！")
         sys.exit(1)
 
-    print("🚀 启动 Rustix 保活流程 (Chromium 页面直连 + socks5h 远程 DNS 双路径模式)...")
+    print("🚀 启动 Rustix 保活流程 (Xvfb 桌面真机渲染模式)...")
 
-    proxy_pw = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
-    proxy_config = {"server": proxy_pw} if proxy_pw else None
+    proxy_server = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
+    proxy_config = {"server": proxy_server} if proxy_server else None
 
     async with async_playwright() as p:
+        # 核心修复点：使用 headless=False 配合 xvfb，以真正的图形界面浏览器运行，突破 Cloudflare TLS 指纹封锁
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
+                "--start-maximized",
             ],
             proxy=proxy_config,
         )
 
-        # 挂载全局 Authorization 认证头
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 768},
-            extra_http_headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Accept": "application/json",
-            },
+            locale="zh-CN",
         )
         page = await context.new_page()
 
-        # 1. 访问主页建立网络连接通道
-        print("🌐 步骤 1: 访问 Rustix 控制台主页建立连接...")
+        # 抹除 WebDriver 特征变量
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # 1. 载入控制台主页通过 Cloudflare 校验
+        print("🌐 步骤 1: 访问 Rustix 控制台主页突破防火墙...")
         try:
-            res = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-            print(f"  └─ 主页响应状态码: HTTP {res.status if res else '200'}")
+            res = await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+            print(f"  └─ 主页响应 HTTP 状态码: {res.status if res else '200'}")
         except Exception as e:
-            print(f"  └─ 主页访问提示: {e}")
+            print(f"  └─ 页面加载提示: {e}")
 
-        await asyncio.sleep(5)
+        # 留出时间供 Cloudflare 人机验证自动解算
+        print("⏳ 等待 Cloudflare 前端盾解算...")
+        await asyncio.sleep(8)
+        await page.screenshot(path="screenshots/cf_passed.png")
 
-        # 2. 查询服务器初始状态
-        print("🔍 步骤 2: 请求 API 探测服务器当前状态...")
-        code, json_data, raw_text = await get_status_via_page(page)
+        # 同源 Fetch 函数定义 (在已通畅的页面上下文内发起通信，绕过 CORS 和外部网络断连)
+        get_status_js = """
+        async ({ serverId, apiKey }) => {
+            try {
+                const res = await fetch('/api/client/servers/' + serverId + '/resources', {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': 'Bearer ' + apiKey,
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    }
+                });
+                const text = await res.text();
+                try {
+                    return { ok: true, status: res.status, json: JSON.parse(text) };
+                } catch(e) {
+                    return { ok: false, status: res.status, raw: text };
+                }
+            } catch (err) {
+                return { ok: false, error: err.toString() };
+            }
+        }
+        """
 
-        if code != 200 or not json_data:
-            print(f"  └─ 浏览器页面读取非 200 (HTTP {code})，自动切换至 socks5h 远程 DNS 通道...")
-            code, json_data, raw_text = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
+        # 2. 检查服务器是否已经启动
+        print("🔍 步骤 2: 检查服务器当前运行状态...")
+        res_info = await page.evaluate(get_status_js, {"serverId": SERVER_ID, "apiKey": API_KEY})
 
         init_status = "unknown"
-        if json_data and isinstance(json_data, dict):
-            init_status = json_data.get("attributes", {}).get("current_state", "unknown")
-            print(f"  └─ 查询成功，当前服务器状态: [{init_status}]")
+        if res_info.get("ok") and "json" in res_info:
+            init_status = res_info["json"].get("attributes", {}).get("current_state", "unknown")
+            print(f"  └─ 当前服务器状态为: [{init_status}]")
         else:
-            print(f"  └─ 接口响应 HTTP {code}，内容: {raw_text[:120]}")
+            print(f"  └─ 读取状态失败，详细返回: {res_info}")
 
-        # 若正在运行，直接通知并成功退出
+        # 如果已经是启动或正在启动状态，不用点击启动，直接通知并结束
         if init_status in ["running", "starting"]:
-            print("🎉 服务器正在正常运行中，无需重启。")
-            notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
+            print("🎉 服务器处于启动状态，无需执行开机操作。")
+            notify(f"🚀 Rustix 服务器已在运行中！\n\n- 当前状态: [{init_status.upper()}]")
             await browser.close()
             sys.exit(0)
 
-        # 3. 发送开机指令
-        print("⚡ 步骤 3: 下发 [start] 电源指令...")
-        p_code, p_raw = await send_power_via_xhr(page)
+        # 3. 如果处于停止/离线状态，执行启动指令
+        print(f"⚡ 步骤 3: 当前状态为 [{init_status}]，下发 [start] 启动指令...")
+        send_start_js = """
+        async ({ serverId, apiKey }) => {
+            try {
+                const res = await fetch('/api/client/servers/' + serverId + '/power', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + apiKey,
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ signal: 'start' })
+                });
+                return { ok: true, status: res.status };
+            } catch (err) {
+                return { ok: false, error: err.toString() };
+            }
+        }
+        """
 
-        if p_code not in [200, 204]:
-            print(f"  └─ 页面 XHR 响应 HTTP {p_code}，切换为 socks5h 远程 DNS 通道重试...")
-            p_code, _, p_raw = requests_fallback(
-                f"/api/client/servers/{SERVER_ID}/power", "POST", {"signal": "start"}
-            )
+        power_res = await page.evaluate(send_start_js, {"serverId": SERVER_ID, "apiKey": API_KEY})
+        power_status = power_res.get("status", 0)
+        print(f"  └─ 启动指令响应状态码: HTTP {power_status}")
 
-        print(f"  └─ [start] 指令响应状态码: HTTP {p_code}")
-        power_success = p_code in [200, 204]
-
-        # 4. 轮询确认开机状态
-        print("⏳ 步骤 4: 轮询确认服务器状态更新...")
+        # 4. 轮询确认状态更新
+        print("⏳ 步骤 4: 轮询确认服务器状态变更...")
         final_status = "unknown"
         for i in range(1, 6):
             await asyncio.sleep(4)
-            c_code, c_json, _ = await get_status_via_page(page)
-            if c_code != 200 or not c_json:
-                c_code, c_json, _ = requests_fallback(f"/api/client/servers/{SERVER_ID}/resources", "GET")
-
-            if c_json and isinstance(c_json, dict):
-                curr = c_json.get("attributes", {}).get("current_state", "unknown")
+            check_info = await page.evaluate(get_status_js, {"serverId": SERVER_ID, "apiKey": API_KEY})
+            if check_info.get("ok") and "json" in check_info:
+                curr = check_info["json"].get("attributes", {}).get("current_state", "unknown")
                 print(f"  └─ 轮询第 {i}/5 次状态: [{curr}]")
                 if curr in ["running", "starting"]:
                     final_status = curr
                     break
-            else:
-                print(f"  └─ 轮询第 {i}/5 次 HTTP {c_code}")
 
         await browser.close()
 
-        # 5. 结果判定与 Telegram 通知
+        # 5. 结果判定与通知
         if final_status in ["running", "starting"]:
-            notify(f"🚀 Rustix 保活成功！\n\n- 当前最新状态: [{final_status.upper()}]")
+            notify(f"🚀 Rustix 启动成功！\n\n- 最新状态: [{final_status.upper()}]")
             sys.exit(0)
-        elif power_success:
-            notify(f"🚀 Rustix 开机指令下发成功！\n\n- API 响应: HTTP {p_code}\n- 开机信号已成功送达后台。")
+        elif power_status in [200, 204]:
+            notify(f"🚀 Rustix 启动指令已成功送达！\n\n- 接口响应: HTTP {power_status}")
             sys.exit(0)
         else:
-            notify(f"❌ Rustix 保活失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
+            notify(f"❌ Rustix 启动失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
             sys.exit(1)
 
 
