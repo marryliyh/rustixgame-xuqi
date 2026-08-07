@@ -26,7 +26,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install playwright requests
+          pip install --upgrade pip
+          pip install playwright requests curl_cffi websockets requests[socks]
           playwright install chrome
           playwright install-deps
 
@@ -71,6 +72,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             *.png
+            screenshots/
             singbox.log
 
       - name: Delete old workflow runs
