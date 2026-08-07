@@ -1,11 +1,12 @@
 import os
 import sys
 import time
+import json
 import asyncio
 import subprocess
 
 # 自动检查并补全必要依赖
-for pkg in ["requests", "playwright", "curl_cffi"]:
+for pkg in ["requests", "playwright"]:
     try:
         __import__(pkg)
     except ImportError:
@@ -13,7 +14,6 @@ for pkg in ["requests", "playwright", "curl_cffi"]:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "requests[socks]"])
 
 import requests
-from curl_cffi import requests as cffi_requests
 from playwright.async_api import async_playwright
 
 # 环境变量配置
@@ -43,10 +43,13 @@ def notify(text):
         print(f"[TG] 通知发送失败: {e}")
 
 
-async def get_cf_session():
-    """使用 Playwright 配合代理穿透 Cloudflare，安全提取 Cookie 且不崩溃"""
-    print("🌐 步骤 0: 启动 Chromium 浏览器，解算 Cloudflare 防火墙...")
-    
+async def async_main():
+    if not API_KEY:
+        print("❌ 错误：未配置 API_KEY！")
+        sys.exit(1)
+
+    print("🚀 启动 Rustix 保活流程 (Chromium 上下文原生 API 请求模式)...")
+
     proxy_server = PROXY_URL.replace("socks5h://", "socks5://") if PROXY_URL else None
     proxy_config = {"server": proxy_server} if proxy_server else None
 
@@ -68,139 +71,106 @@ async def get_cf_session():
         )
         page = await context.new_page()
 
-        cookies_dict = {}
+        # 1. 打开主页解算 Cloudflare 防火墙盾
+        print("🌐 步骤 1: 访问 Rustix 控制台解算 Cloudflare 防火墙...")
         try:
-            print(f"⏳ 正在通过代理 ({proxy_server}) 访问 Rustix 控制台...")
-            response = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-            
-            # 等待 Cloudflare 前端 JS 演算完毕
-            await page.wait_for_timeout(8000)
-            
-            # 保存运行过程截图
-            await page.screenshot(path="screenshots/cf_pass_check.png")
-            
-            # 获取通过盾后的 Cookies
-            cookies_list = await context.cookies()
-            cookies_dict = {c["name"]: c["value"] for c in cookies_list}
-            print(f"  └─ 页面响应 HTTP: {response.status if response else 'UNKNOWN'}")
-            print(f"  └─ 提取 Cookie 数量: {len(cookies_dict)} 项")
-
+            res = await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            print(f"  └─ 主页响应 HTTP 状态码: {res.status if res else 'UNKNOWN'}")
         except Exception as e:
-            print(f"  └─ ⚠️ 页面加载阻断或超时: {e}")
-            try:
-                await page.screenshot(path="screenshots/cf_error.png")
-            except Exception:
-                pass
-        finally:
-            await browser.close()
+            print(f"  └─ 页面加载提示: {e}")
 
-        return cookies_dict
+        # 等待 Cloudflare 验证完成并写入 Cookies
+        print("⏳ 等待 Cloudflare 验证完成...")
+        await page.wait_for_timeout(8000)
+        await page.screenshot(path="screenshots/cf_passed.png")
+
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        # 2. 查询服务器初始状态 (使用 context.request 走 Chromium 原生协议栈，无 CORS 限制，不受 curl SSL 报错影响)
+        print("🔍 步骤 2: 请求 API 探测服务器当前状态...")
+        init_status = "unknown"
+        try:
+            api_res = await context.request.get(
+                f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
+                headers=headers,
+            )
+            print(f"  └─ API HTTP 状态码: {api_res.status}")
+            if api_res.status == 200:
+                data = await api_res.json()
+                init_status = data.get("attributes", {}).get("current_state", "unknown")
+                print(f"  └─ 当前服务器状态: [{init_status}]")
+            else:
+                body = await api_res.text()
+                print(f"  └─ 响应片段: {body[:150]}")
+        except Exception as e:
+            print(f"  └─ API 请求异常: {e}")
+
+        # 若已经在运行，直接成功退出
+        if init_status in ["running", "starting"]:
+            print("🎉 服务器正在正常运行中，无需重启。")
+            notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
+            await browser.close()
+            sys.exit(0)
+
+        # 3. 发送开机指令
+        print("⚡ 步骤 3: 下发 [start] 电源指令...")
+        power_success = False
+        p_code = 0
+        try:
+            p_res = await context.request.post(
+                f"{BASE_URL}/api/client/servers/{SERVER_ID}/power",
+                headers=headers,
+                data=json.dumps({"signal": "start"}),
+            )
+            p_code = p_res.status
+            print(f"  └─ 电源指令 HTTP 状态码: {p_code}")
+            if p_code in [200, 204]:
+                power_success = True
+        except Exception as e:
+            print(f"  └─ 发送指令异常: {e}")
+
+        # 4. 轮询确认状态
+        print("⏳ 步骤 4: 轮询确认服务器状态变更...")
+        final_status = "unknown"
+        for i in range(1, 6):
+            await asyncio.sleep(4)
+            try:
+                check_res = await context.request.get(
+                    f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
+                    headers=headers,
+                )
+                if check_res.status == 200:
+                    curr_data = await check_res.json()
+                    curr = curr_data.get("attributes", {}).get("current_state", "unknown")
+                    print(f"  └─ 轮询第 {i}/5 次状态: [{curr}]")
+                    if curr in ["running", "starting"]:
+                        final_status = curr
+                        break
+                else:
+                    print(f"  └─ 轮询第 {i}/5 次 HTTP {check_res.status}")
+            except Exception as e:
+                print(f"  └─ 轮询网络异常: {e}")
+
+        await browser.close()
+
+        # 5. 结果判定与 Telegram 通知
+        if final_status in ["running", "starting"]:
+            notify(f"🚀 Rustix 保活成功！\n\n- 当前最新状态: [{final_status.upper()}]")
+            sys.exit(0)
+        elif power_success:
+            notify(f"🚀 Rustix 开机指令下发成功！\n\n- API 响应: HTTP {p_code}\n- 开机指令已成功送到服务端后台。")
+            sys.exit(0)
+        else:
+            notify(f"❌ Rustix 保活失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
+            sys.exit(1)
 
 
 def main():
-    if not API_KEY:
-        print("❌ 错误：未配置 API_KEY！")
-        sys.exit(1)
-
-    print("🚀 启动 Rustix 保活流程 (Playwright 代理穿透 + curl_cffi 组合防护模式)...")
-
-    # 1. 穿透 Cloudflare 抓取凭证 Cookies
-    cookies = asyncio.run(get_cf_session())
-
-    proxies = {
-        "http": PROXY_URL,
-        "https": PROXY_URL,
-    } if PROXY_URL else None
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-
-    # 创建带 TLS 指纹伪装与 Cookies 复用的 Session
-    session = cffi_requests.Session()
-    session.headers.update(headers)
-    if cookies:
-        session.cookies.update(cookies)
-
-    # 2. 查询服务器初始状态
-    print("🔍 步骤 1: 请求 API 探测服务器当前状态...")
-    init_status = "unknown"
-    try:
-        res = session.get(
-            f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=20,
-        )
-        print(f"  └─ API HTTP 状态码: {res.status_code}")
-        if res.status_code == 200:
-            data = res.json()
-            init_status = data.get("attributes", {}).get("current_state", "unknown")
-            print(f"  └─ 当前服务器状态: [{init_status}]")
-        else:
-            print(f"  └─ 响应片段: {res.text[:150]}")
-    except Exception as e:
-        print(f"  └─ API 请求异常: {e}")
-
-    # 若正在运行则直接成功退出
-    if init_status in ["running", "starting"]:
-        print("🎉 服务器正在正常运行中，无需重复开启。")
-        notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
-        sys.exit(0)
-
-    # 3. 发送开机指令
-    print("⚡ 步骤 2: 下发 [start] 电源指令...")
-    power_success = False
-    try:
-        p_res = session.post(
-            f"{BASE_URL}/api/client/servers/{SERVER_ID}/power",
-            json={"signal": "start"},
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=20,
-        )
-        print(f"  └─ 电源指令 HTTP 状态码: {p_res.status_code}")
-        if p_res.status_code in [200, 204]:
-            power_success = True
-    except Exception as e:
-        print(f"  └─ 电源指令发送异常: {e}")
-
-    # 4. 轮询确认开机状态
-    print("⏳ 步骤 3: 轮询确认服务器状态变更...")
-    final_status = "unknown"
-    for i in range(1, 6):
-        time.sleep(4)
-        try:
-            check_res = session.get(
-                f"{BASE_URL}/api/client/servers/{SERVER_ID}/resources",
-                proxies=proxies,
-                impersonate="chrome120",
-                timeout=20,
-            )
-            if check_res.status_code == 200:
-                curr = check_res.json().get("attributes", {}).get("current_state", "unknown")
-                print(f"  └─ 轮询第 {i}/5 次状态: [{curr}]")
-                if curr in ["running", "starting"]:
-                    final_status = curr
-                    break
-            else:
-                print(f"  └─ 轮询第 {i}/5 次响应 HTTP {check_res.status_code}")
-        except Exception as e:
-            print(f"  └─ 轮询网络异常: {e}")
-
-    # 5. 结果判定与 Telegram 通知
-    if final_status in ["running", "starting"]:
-        notify(f"🚀 Rustix 保活成功！\n\n- 当前最新状态: [{final_status.upper()}]")
-        sys.exit(0)
-    elif power_success:
-        notify(f"🚀 Rustix 开机指令下发成功！\n\n- API 响应: HTTP 200/204\n- 开机指令已成功送达服务端后台。")
-        sys.exit(0)
-    else:
-        notify(f"❌ Rustix 保活失败！\n\n- 初始状态: [{init_status}]\n- 最终状态: [{final_status}]")
-        sys.exit(1)
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
