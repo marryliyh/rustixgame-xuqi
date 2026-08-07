@@ -3,26 +3,31 @@ import sys
 import time
 import json
 import asyncio
-from curl_cffi import requests as cffi_requests
+import subprocess
+
+# 1. 动态依赖检查与安装
+required_pkgs = ["requests", "playwright"]
+for pkg in required_pkgs:
+    try:
+        if pkg == "playwright":
+            from playwright.async_api import async_playwright
+        else:
+            import requests
+    except ImportError:
+        print(f"📦 自动安装 Python 依赖: {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "requests[socks]"])
+
 import requests
-import websockets
 from playwright.async_api import async_playwright
 
-# 1. 环境变量配置
+# 2. 环境变量配置
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 API_KEY = os.getenv("API_KEY", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808").strip()
 
-if PROXY_URL.startswith("socks5://"):
-    PROXY_URL_SOCKS5H = PROXY_URL.replace("socks5://", "socks5h://")
-elif PROXY_URL and not PROXY_URL.startswith("socks5h://") and not PROXY_URL.startswith("http"):
-    PROXY_URL_SOCKS5H = f"socks5h://{PROXY_URL}"
-else:
-    PROXY_URL_SOCKS5H = PROXY_URL
-
 SERVER_ID = "226fd977"
-BASE_URL = f"https://my.rustix.me/api/client/servers/{SERVER_ID}"
+BASE_URL = "https://my.rustix.me"
 CONSOLE_URL = f"https://my.rustix.me/server/{SERVER_ID}/console"
 
 os.makedirs("screenshots", exist_ok=True)
@@ -43,7 +48,7 @@ def notify(text):
 
 
 def upload_to_website(file_path):
-    """上传截图到公网图床网址，返回在线查看/下载链接"""
+    """上传截图到 catbox.moe 图床，返回在线查看链接"""
     if not os.path.exists(file_path):
         return None
     try:
@@ -63,71 +68,64 @@ def upload_to_website(file_path):
     return None
 
 
-def get_server_status(headers, proxies):
-    """通过 API 查询服务器真实状态"""
-    try:
-        r = cffi_requests.get(
-            f"{BASE_URL}/resources",
-            headers=headers,
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=15,
-        )
-        if r.status_code == 200:
-            try:
-                res_data = r.json()
-                state = res_data.get("attributes", {}).get("current_state", "unknown")
-                print(f"  └─ API 响应成功，当前状态: [{state}]")
-                return state, "OK"
-            except Exception:
-                print("  └─ API 返回了非 JSON 结构 (疑似 Cloudflare 人机验证)")
-                return "unknown", "CLOUDFLARE_CHALLENGE"
-        else:
-            print(f"  └─ API 状态码异常: {r.status_code}")
-            return "unknown", f"HTTP_{r.status_code}"
-    except Exception as e:
-        print(f"  └─ 请求发生网络异常: {e}")
-        return "unknown", "NETWORK_ERROR"
+async def async_main():
+    if not API_KEY:
+        print("❌ 错误：未配置 API_KEY！")
+        sys.exit(1)
 
-
-async def trigger_via_websocket(headers, proxies):
-    """通过 WebSocket 信道下发启动指令"""
-    print("🔌 尝试通过 WebSocket 信道下发启动指令...")
-    try:
-        ws_info_res = cffi_requests.get(
-            f"{BASE_URL}/websocket",
-            headers=headers,
-            proxies=proxies,
-            impersonate="chrome120",
-            timeout=15,
-        )
-        if ws_info_res.status_code != 200:
-            return False
-
-        ws_data = ws_info_res.json().get("data", {})
-        token, socket_url = ws_data.get("token"), ws_data.get("socket")
-
-        if not token or not socket_url:
-            return False
-
-        async with websockets.connect(socket_url, origin="https://my.rustix.me", open_timeout=15) as ws:
-            await ws.send(json.dumps({"event": "auth", "args": [token]}))
-            await asyncio.sleep(1)
-            await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
-            await asyncio.sleep(2)
-            print("  └─ WebSocket 启动指令已成功下发！")
-            return True
-    except Exception as e:
-        print(f"  └─ WebSocket 触发跳过: {e}")
-        return False
-
-
-async def capture_page_screenshot():
-    """使用 Playwright 打开控制台网页进行渲染与截图"""
-    print("📸 启动 Playwright 打开控制台网页截图...")
-    proxy_config = {"server": PROXY_URL.replace("socks5h://", "socks5://")} if PROXY_URL else None
+    print("🚀 启动 Rustix 状态检测与保活流程 (Chromium 原生网络栈)...")
     
+    proxy_config = {"server": PROXY_URL.replace("socks5h://", "socks5://")} if PROXY_URL else None
+
     async with async_playwright() as p:
+        # 使用 Chromium 原生 API 上下文（具备完整的 Chrome 协议栈，避开 TLS 拦截）
+        api = await p.request.new_context(
+            base_url=BASE_URL,
+            extra_http_headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            },
+            proxy=proxy_config,
+        )
+
+        # 1. 探测初始状态
+        print("🔍 步骤 1: 请求 API 探测服务器当前状态...")
+        init_status = "unknown"
+        cf_blocked = False
+
+        try:
+            res = await api.get(f"/api/client/servers/{SERVER_ID}/resources")
+            if res.status == 200:
+                data = await res.json()
+                init_status = data.get("attributes", {}).get("current_state", "unknown")
+                print(f"  └─ API 响应成功，当前状态: [{init_status}]")
+            elif res.status in [403, 503]:
+                print(f"  └─ ⚠️ 被 Cloudflare 拦截 (HTTP {res.status})")
+                cf_blocked = True
+            else:
+                print(f"  └─ API 状态码异常: {res.status}")
+        except Exception as e:
+            print(f"  └─ 请求发生网络异常: {e}")
+
+        # 2. 如果检测到服务器已经在运行，直接成功退出
+        if init_status in ["running", "starting"]:
+            print("🎉 服务器正常运行中，无需重启。")
+            notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
+            sys.exit(0)
+
+        # 3. 若未在运行，发送 Start 电源指令拉起
+        print("⚡ 步骤 2: 发送 [start] 开机指令...")
+        try:
+            p_res = await api.post(f"/api/client/servers/{SERVER_ID}/power", data=json.dumps({"signal": "start"}))
+            print(f"  └─ [start] 指令响应状态码: {p_res.status}")
+        except Exception as e:
+            print(f"  └─ [start] 指令下发失败: {e}")
+
+        # 4. 尝试通过网页渲染截图
+        print("📸 步骤 3: 打开控制台网页渲染截图...")
+        shot_url = None
         try:
             browser = await p.chromium.launch(
                 headless=True,
@@ -141,57 +139,40 @@ async def capture_page_screenshot():
             shot_path = "screenshots/console_status.png"
             await page.screenshot(path=shot_path, full_page=True)
             await browser.close()
-            print(f"📸 本地截图已保存至: {shot_path}")
 
-            img_url = upload_to_website(shot_path)
-            return img_url
+            shot_url = upload_to_website(shot_path)
         except Exception as e:
-            print(f"  └─ 网页截图捕捉异常: {e}")
-            return None
+            print(f"  └─ 截图渲染异常: {e}")
 
+        link_info = f"\n📸 最新截图链接: {shot_url}" if shot_url else "\n📸 截图文件已打包存入 GitHub Artifacts"
 
-async def async_main():
-    if not API_KEY:
-        print("❌ 错误：未配置 API_KEY！")
-        sys.exit(1)
+        # 5. 轮询确认最终状态
+        print("⏳ 步骤 4: 轮询确认服务器最新状态...")
+        final_status = "unknown"
+        for i in range(1, 6):
+            await asyncio.sleep(4)
+            try:
+                check_res = await api.get(f"/api/client/servers/{SERVER_ID}/resources")
+                if check_res.status == 200:
+                    curr_data = await check_res.json()
+                    curr = curr_data.get("attributes", {}).get("current_state", "unknown")
+                    print(f"  └─ 轮询第 {i}/5 次: [{curr}]")
+                    if curr in ["running", "starting"]:
+                        final_status = curr
+                        break
+            except Exception:
+                pass
 
-    print("🚀 启动 Rustix 状态检测与保活流程...")
-    
-    proxies = {"http": PROXY_URL_SOCKS5H, "https": PROXY_URL_SOCKS5H} if PROXY_URL_SOCKS5H else None
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    }
-
-    # 1. 探测初始状态
-    init_status, err_reason = get_server_status(headers, proxies)
-    print(f"📊 探测结果: 状态=[{init_status}], 诊断信息=[{err_reason}]")
-
-    # 2. 如果正常运行，直接退出
-    if init_status in ["running", "starting"]:
-        print("🎉 服务器正常运行中，无需触发重启。")
-        notify(f"🚀 Rustix 服务器运行正常！\n\n- 当前状态: {init_status.upper()}")
-        sys.exit(0)
-
-    # 3. 尝试下发 WebSocket 命令拉起
-    await trigger_via_websocket(headers, proxies)
-
-    # 4. 强制执行 Playwright 截图
-    shot_url = await capture_page_screenshot()
-    link_info = f"\n📸 最新截图链接: {shot_url}" if shot_url else "\n📸 截图文件已打包存入 GitHub Artifacts"
-
-    # 5. 再次轮询确认状态
-    time.sleep(5)
-    final_status, final_reason = get_server_status(headers, proxies)
-
-    if final_status in ["running", "starting"]:
-        notify(f"🚀 Rustix 保活成功！\n\n- 当前状态: {final_status.upper()}{link_info}")
-        sys.exit(0)
-    else:
-        notify(f"⚠️ Rustix 保活状态: [{final_status}]\n- 诊断信息: {final_reason}{link_info}")
-        sys.exit(1)
+        # 6. 处理结果并发送 TG 通知
+        if final_status in ["running", "starting"]:
+            notify(f"🚀 Rustix 保活成功！\n\n- 当前状态: {final_status.upper()}{link_info}")
+            sys.exit(0)
+        elif cf_blocked:
+            notify(f"⚠️ Rustix 保活提醒：代理节点 IP 被 Cloudflare 拦截 (Access Denied)\n\n请更换 GitHub Secrets 中的 NODE_LINK 订阅节点后再试！{link_info}")
+            sys.exit(1)
+        else:
+            notify(f"⚠️ Rustix 保活状态: [{final_status}]\n- 初始状态: [{init_status}]{link_info}")
+            sys.exit(1)
 
 
 def main():
