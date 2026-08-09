@@ -5,61 +5,162 @@ on:
     - cron: '37 */2 * * *'
   workflow_dispatch:
 
+
 jobs:
+
   run-script:
+
     runs-on: ubuntu-22.04
+
     timeout-minutes: 10
+
     permissions:
       actions: write
       contents: read
 
+
     steps:
+
+
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install Dependencies, Google Chrome, and Xvfb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          pip install --upgrade pip
-          pip install playwright requests curl_cffi websockets requests[socks]
-          playwright install --with-deps chromium
 
-      - name: 🌐 设置代理 (sing-box)
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt update
+
+          sudo apt install -y \
+            xvfb \
+            wget \
+            curl \
+            unzip \
+            jq
+
+
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          pip install \
+            seleniumbase \
+            requests \
+            curl_cffi \
+            websockets \
+            requests[socks]
+
+
+
+      - name: Install SeleniumBase Browser
+        run: |
+          seleniumbase install
+
+
+
+      - name: Setup sing-box Proxy
+
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
+
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+          echo "Downloading proxy installer..."
+
+          wget \
+            --timeout=30 \
+            --tries=3 \
+            -O setup_proxy.sh \
+            https://main.ssss.nyc.mn/setup_proxy.sh
+
+
+          chmod +x setup_proxy.sh
+
+
+          echo "Running proxy installer..."
+
+          bash -x setup_proxy.sh "$NODE_LINK"
+
+
+
+          echo "Checking sing-box process..."
+
+          ps aux | grep sing-box || true
+
+
+
+          echo "Checking proxy port..."
+
+          ss -tulpn | grep 10808 || true
+
+
 
       - name: Run Rustix automation
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          API_KEY: ${{ secrets.API_KEY }}
-          PROXY_URL: socks5://127.0.0.1:10808
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python rustix.py
 
-      - name: Upload status screenshots
+        env:
+
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+          API_KEY: ${{ secrets.API_KEY }}
+
+          PROXY_URL: socks5://127.0.0.1:10808
+
+
+        run: |
+
+          echo "Starting Rustix..."
+
+          xvfb-run \
+            --auto-servernum \
+            --server-args="-screen 0 1366x768x24" \
+            python rustix.py
+
+
+
+
+      - name: Upload Debug Files
+
         if: always()
+
         uses: actions/upload-artifact@v4
+
         with:
-          name: rustix-status-screenshots-${{ github.run_number }}
+
+          name: rustix-debug-${{ github.run_number }}
+
           if-no-files-found: ignore
+
           path: |
             *.png
             screenshots/
-            singbox.log
+            *.log
+            setup_proxy.sh
 
-      - name: Delete old workflow runs
+
+
+
+      - name: Delete Old Workflow Runs
+
         if: always()
+
         uses: Mattraks/delete-workflow-runs@v2
+
         with:
+
           token: ${{ github.token }}
+
           repository: ${{ github.repository }}
+
           retain_days: 0
+
           keep_minimum_runs: 2
